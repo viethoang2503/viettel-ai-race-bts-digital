@@ -1,0 +1,21 @@
+# Dataset (large, lives on Google Drive, not in git)
+VAI_NVS_DATA_ROUND2/
+
+# Model outputs / checkpoints / renders (live on Drive)
+outputs/
+checkpoints/
+*.ply
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Colab / Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
