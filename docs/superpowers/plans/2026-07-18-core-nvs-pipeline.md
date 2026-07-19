@@ -2,18 +2,23 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the end-to-end baseline pipeline (data validation -> pose math -> train wrapper
--> render-from-CSV -> metrics -> submission packaging) so a fully compliant, correctly-formatted
-`submission.zip` can be produced for all 7 scenes using plain 3D Gaussian Splatting, before any
-advanced technique (floater cleanup, depth reg, anti-aliasing, appearance embedding) is added.
+**Goal:** Build the end-to-end baseline pipeline (data validation -> pose math -> leak-free
+holdout training -> render-from-CSV -> metrics -> submission packaging) so a fully compliant,
+correctly-formatted `submission.zip` can be produced for all 7 scenes using plain 3D Gaussian
+Splatting, before any advanced technique (floater cleanup, depth reg, anti-aliasing, appearance
+embedding) is added.
 
 **Architecture:** Vendor `graphdeco-inria/gaussian-splatting` as a git submodule for the actual
 GPU training/rendering code. All new code lives in `src/`, split by responsibility (common pose
 math, data validation, evaluation, training wrapper, rendering, submission). GPU-free logic
-(pose math, metric formula, holdout selection, submission packaging/validation, orchestration
-wiring) gets real `pytest` unit tests runnable on the local no-GPU machine. GPU-dependent steps
-(actual training, actual CUDA rendering) get a documented manual verification procedure to run
-on Colab, since this local machine has no CUDA device.
+(pose math, metric formula, holdout selection/enforcement, submission packaging/validation,
+orchestration wiring) gets real `pytest` unit tests runnable on the local no-GPU machine.
+GPU-dependent steps (actual training, actual CUDA rendering) get a documented manual
+verification procedure to run on Colab, since this local machine has no CUDA device. Each scene
+is trained twice: once on a holdout-excluded copy of the scene (Task 8b) purely to produce an
+unbiased local score, and once on the full scene to produce the checkpoint that is actually
+rendered and submitted — the two are never conflated. Output filenames always match
+`test_poses.csv`'s `image_name` exactly, including its original extension.
 
 **Tech Stack:** Python 3.10+ (see note in Task 1 about the local Python 3.14 interpreter),
 PyTorch (CPU-only locally, CUDA on Colab), `lpips`, `scikit-image`, `numpy`, `pyyaml`, `pytest`.
@@ -30,11 +35,18 @@ PyTorch (CPU-only locally, CUDA on Colab), `lpips`, `scikit-image`, `numpy`, `py
 - Pose convention: quaternion is COLMAP world-to-camera (`qw,qx,qy,qz`), translation is
   COLMAP world-to-camera (`tx,ty,tz`) — same convention as `images.bin`.
 - Submission format (spec section 14 / exam mục 7): `submission.zip` containing
-  `scene_XXX/<image_name>` per scene, exact name and `width x height` from `test_poses.csv`.
+  `<submission_dir>/<image_name>` per scene, using the **exact `image_name` string from
+  `test_poses.csv` including its original extension** (never renamed to `.png`), and exact
+  `width x height` from `test_poses.csv`. `<submission_dir>` is a per-scene config value (see
+  Task 2) — the exam's example illustration uses a generic `scene_001/scene_002` pattern, but
+  the real dataset's scene identifiers are `HCM0421`, `chair`, `bonsai`, etc. This plan defaults
+  `submission_dir` to the scene's real name; **confirm with the organizers before the real
+  submission whether literal `scene_001`-style numbering is required instead** — this cannot be
+  resolved from the provided data alone.
 - This plan covers the **baseline-only** pipeline. Floater cleanup, depth regularization,
   anti-aliasing, appearance embedding, VRAM guard, and auto-config-selection are **out of
-  scope** for this plan — they are a follow-up plan (`docs/superpowers/plans/<next>-advanced-
-  techniques.md`) built on top of these modules.
+  scope** for this plan — they are covered by the follow-up plan
+  `docs/superpowers/plans/2026-07-18-advanced-techniques.md`, built on top of these modules.
 
 ---
 
@@ -118,20 +130,34 @@ git commit -m "Vendor gaussian-splatting baseline and pin environment deps"
 **Interfaces:**
 - Produces: `load_scenes(config_path: str = "configs/scenes.yaml") -> list[SceneConfig]` where
   `SceneConfig` is a dataclass with fields `name: str`, `root: Path`, `train_images_dir: Path`,
-  `sparse_dir: Path`, `test_poses_csv: Path`.
+  `sparse_dir: Path`, `test_poses_csv: Path`, `submission_dir: str = ""` (defaults to `name`
+  when empty — see `effective_submission_dir` property below), plus a read-only property
+  `effective_submission_dir -> str` returning `submission_dir or name`.
 
 - [ ] **Step 1: Write `configs/scenes.yaml`**
+
+`submission_dir` is listed explicitly per scene (even though it currently equals `name`) so the
+folder-naming convention used in the final `submission.zip` (Task 10/11/12) is a single,
+easy-to-edit config value rather than an assumption buried in code — see the Global Constraints
+note above about confirming this with the organizers.
 
 ```yaml
 dataset_root: VAI_NVS_DATA_ROUND2
 scenes:
-  - HCM0421
-  - HCM0539
-  - HCM0540
-  - HCM0644
-  - HCM0674
-  - chair
-  - bonsai
+  - name: HCM0421
+    submission_dir: HCM0421
+  - name: HCM0539
+    submission_dir: HCM0539
+  - name: HCM0540
+    submission_dir: HCM0540
+  - name: HCM0644
+    submission_dir: HCM0644
+  - name: HCM0674
+    submission_dir: HCM0674
+  - name: chair
+    submission_dir: chair
+  - name: bonsai
+    submission_dir: bonsai
 ```
 
 - [ ] **Step 2: Write the failing test**
@@ -155,6 +181,14 @@ def test_load_scenes_returns_seven_scenes_with_correct_paths():
     assert chair.sparse_dir == Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0")
     assert chair.test_poses_csv == Path("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv")
     assert chair.test_poses_csv.exists()
+    assert chair.submission_dir == "chair"
+    assert chair.effective_submission_dir == "chair"
+    # gs_source_dir must be the directory that directly contains images/
+    # and sparse/0/ as siblings, per the baseline's expected layout —
+    # NOT chair.root, which is one level too shallow for this dataset.
+    assert chair.gs_source_dir == Path("VAI_NVS_DATA_ROUND2/chair/train")
+    assert (chair.gs_source_dir / "images").exists()
+    assert (chair.gs_source_dir / "sparse" / "0").exists()
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -183,6 +217,37 @@ class SceneConfig:
     train_images_dir: Path
     sparse_dir: Path
     test_poses_csv: Path
+    submission_dir: str = ""
+
+    @property
+    def effective_submission_dir(self) -> str:
+        """Folder name to use inside submission.zip for this scene.
+
+        Falls back to `name` when `submission_dir` is not set, so existing
+        code/tests that construct SceneConfig without the new field keep
+        working unchanged.
+        """
+        return self.submission_dir or self.name
+
+    @property
+    def gs_source_dir(self) -> Path:
+        """Directory to pass as gaussian-splatting's --source_path.
+
+        The vendored baseline expects `<source_path>/images/` and
+        `<source_path>/sparse/0/` as DIRECT children. The real dataset
+        nests these one level deeper (`<scene>/train/images/`,
+        `<scene>/train/sparse/0/`), so `scene.root` itself is NOT a valid
+        --source_path — passing it silently points train.py at a directory
+        with no `images/`, which fails immediately on Colab.
+
+        Always derived from `train_images_dir` (never a separately-set
+        field) so it cannot drift out of sync: `train_images_dir.parent`
+        is `<root>/train` for the raw dataset layout, and is `<root>`
+        itself for a Task 8b filtered scene copy (which is already built
+        flat, with `images/` and `sparse/0/` directly under its root) —
+        both cases resolve correctly without any special-casing.
+        """
+        return self.train_images_dir.parent
 
 
 def load_scenes(config_path: str = "configs/scenes.yaml") -> list[SceneConfig]:
@@ -191,7 +256,8 @@ def load_scenes(config_path: str = "configs/scenes.yaml") -> list[SceneConfig]:
 
     dataset_root = Path(data["dataset_root"])
     scenes = []
-    for name in data["scenes"]:
+    for entry in data["scenes"]:
+        name = entry["name"]
         root = dataset_root / name
         scenes.append(
             SceneConfig(
@@ -200,6 +266,7 @@ def load_scenes(config_path: str = "configs/scenes.yaml") -> list[SceneConfig]:
                 train_images_dir=root / "train" / "images",
                 sparse_dir=root / "train" / "sparse" / "0",
                 test_poses_csv=root / "test" / "test_poses.csv",
+                submission_dir=entry.get("submission_dir", "") or name,
             )
         )
     return scenes
@@ -442,9 +509,63 @@ CHAIR_SPARSE = Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0")
 
 def test_load_sparse_scene_reads_chair_scene():
     scene = load_sparse_scene(CHAIR_SPARSE)
-    assert len(scene.images) == 205
+    # NOT 205 (the file count in train/images/): COLMAP's images.bin
+    # registers more cameras than are distributed as files — the dataset
+    # runs SfM over train+test (and, for the HCM scenes, extra calibration
+    # frames) combined for pose accuracy, then withholds some images'
+    # pixels. Verified directly against the real chair data: 263
+    # registered, 205 with files on disk, and the 58 without a file are
+    # exactly the 58 names in test/test_poses.csv (see test_data_validation
+    # for the scene-wide version of this check). Do not "fix" this number
+    # down to 205 — that would be re-introducing the bug this test exists
+    # to catch.
+    assert len(scene.images) == 263
     assert len(scene.cameras) >= 1
     assert len(scene.points3d) > 0
+
+
+def test_load_sparse_scene_registers_more_images_than_are_distributed_as_files():
+    import csv
+    import os
+
+    scene = load_sparse_scene(CHAIR_SPARSE)
+    registered_names = {img.name for img in scene.images.values()}
+    folder_names = set(os.listdir("VAI_NVS_DATA_ROUND2/chair/train/images"))
+    registered_without_file = registered_names - folder_names
+    assert len(registered_without_file) == 58
+
+    # Don't just trust the magic number 58 — cross-check it's actually the
+    # scene's real test_poses.csv image names, not a coincidence.
+    with open("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv", newline="") as f:
+        test_pose_names = {row["image_name"] for row in csv.DictReader(f)}
+    assert registered_without_file == test_pose_names
+
+
+def test_load_sparse_scene_preserves_real_point3d_ids_not_file_order_index():
+    # Regression test: COLMAP point3D_ids are NOT contiguous (point
+    # culling/merging during reconstruction leaves gaps), so re-keying
+    # points3d by file-storage order (0..N-1) instead of the real id
+    # silently returns the WRONG point for any id that coincidentally
+    # collides with a valid 0..N-1 index, corrupting anything that looks
+    # points up via images[...].point3D_ids (e.g. depth-target lookups).
+    scene = load_sparse_scene(CHAIR_SPARSE)
+
+    referenced_ids = {
+        int(pid)
+        for img in scene.images.values()
+        for pid in img.point3D_ids
+        if pid != -1
+    }
+    assert referenced_ids, "fixture sanity: chair images must reference some points"
+    # every id an image references must resolve to a real point
+    assert referenced_ids <= set(scene.points3d.keys())
+    # ids are not just 0..N-1 (proves this isn't accidentally still using
+    # file-order indexing) — real COLMAP ids have gaps and go well beyond
+    # the point count.
+    assert max(referenced_ids) >= len(scene.points3d)
+    # each point's own .id field must match the dict key it's stored under
+    for point_id, point in scene.points3d.items():
+        assert point.id == point_id
 
 
 def test_compute_scene_bbox_returns_min_less_than_max_with_margin():
@@ -478,9 +599,19 @@ Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.common.colmap_io
 
 - [ ] **Step 3: Write `src/common/colmap_io.py`**
 
+**Import mechanism — verified against the real checkout, not the naive approach.** A plain
+`sys.path.insert` + `from scene.colmap_loader import ...` executes
+`third_party/gaussian-splatting/scene/__init__.py` as a side effect of importing the `scene`
+package, which imports `scene.gaussian_model` → `simple_knn._C`, a compiled CUDA extension not
+built in this (or any non-GPU) environment — it fails with `ModuleNotFoundError: No module named
+'simple_knn'` even though `colmap_loader.py` itself only needs `numpy`/`struct`/`collections`.
+Load the module directly by file path instead, bypassing the package `__init__.py` entirely:
+
 ```python
 from __future__ import annotations
 
+import importlib.util
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -491,11 +622,14 @@ _VENDORED_REPO = Path(__file__).resolve().parents[2] / "third_party" / "gaussian
 if str(_VENDORED_REPO) not in sys.path:
     sys.path.insert(0, str(_VENDORED_REPO))
 
-from scene.colmap_loader import (  # noqa: E402
-    read_extrinsics_binary,
-    read_intrinsics_binary,
-    read_points3D_binary,
-)
+_COLMAP_LOADER_PATH = _VENDORED_REPO / "scene" / "colmap_loader.py"
+_spec = importlib.util.spec_from_file_location("_gs_colmap_loader", _COLMAP_LOADER_PATH)
+_colmap_loader = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_colmap_loader)
+
+read_extrinsics_binary = _colmap_loader.read_extrinsics_binary
+read_intrinsics_binary = _colmap_loader.read_intrinsics_binary
+_Point3D = _colmap_loader.Point3D
 
 
 @dataclass(frozen=True)
@@ -505,11 +639,60 @@ class SparseScene:
     points3d: dict
 
 
+def _read_points3d_binary_preserving_ids(path: Path) -> dict:
+    """Parse points3D.bin directly, keyed by the REAL COLMAP point3D_id.
+
+    The vendored `read_points3D_binary` (scene/colmap_loader.py) reads each
+    point's id off the wire and then discards it, returning flat
+    `(xyzs, rgbs, errors)` arrays indexed 0..N-1 in file-storage order
+    instead. COLMAP point3D_ids are NOT contiguous (point culling/merging
+    during reconstruction leaves gaps) — verified against the real chair
+    scene: images.bin's point3D_ids reference ids up to 105456 across
+    80491 points, while file-order indexing only produces keys 0..80490.
+    Re-keying by file order doesn't just drop out-of-range lookups, it
+    silently returns the WRONG point for any id that happens to collide
+    with a valid 0..80490 index (~77% of real ids in the chair scene) —
+    this matters because Plan 2's depth regularization looks points up by
+    exactly this id (`images[...].point3D_ids`), so a wrong or dropped
+    point corrupts that loss silently, no crash, no visible symptom in
+    training loss. Binary layout verified against the same file:
+    - uint64 num_points
+    - per point: struct "<QdddBBBd" (id, x,y,z, r,g,b, error) = 43 bytes,
+      then uint64 track_length, then track_length * "ii" (image_id,
+      point2D_idx) pairs, 8 bytes each.
+    """
+    points3d: dict[int, _Point3D] = {}
+    with open(path, "rb") as fid:
+        num_points = struct.unpack("<Q", fid.read(8))[0]
+        for _ in range(num_points):
+            point_id, x, y, z, r, g, b, error = struct.unpack("<QdddBBBd", fid.read(43))
+            track_length = struct.unpack("<Q", fid.read(8))[0]
+            track_elems = struct.unpack("<" + "ii" * track_length, fid.read(8 * track_length))
+            image_ids = np.array(track_elems[0::2], dtype=int)
+            point2D_idxs = np.array(track_elems[1::2], dtype=int)
+            points3d[point_id] = _Point3D(
+                id=point_id,
+                xyz=np.array([x, y, z]),
+                rgb=np.array([r, g, b]),
+                error=error,
+                image_ids=image_ids,
+                point2D_idxs=point2D_idxs,
+            )
+    return points3d
+
+
 def load_sparse_scene(sparse_dir: Path) -> SparseScene:
+    """Faithful, unfiltered read of the COLMAP sparse model.
+
+    `images` reflects EXACTLY what images.bin registers — this can (and
+    for every scene in this dataset, does) include more entries than
+    there are files in train/images/; see Task 5/Task 8b for where that
+    distinction is actually handled. Do not filter here.
+    """
     sparse_dir = Path(sparse_dir)
     cameras = read_intrinsics_binary(str(sparse_dir / "cameras.bin"))
     images = read_extrinsics_binary(str(sparse_dir / "images.bin"))
-    points3d = read_points3D_binary(str(sparse_dir / "points3D.bin"))
+    points3d = _read_points3d_binary_preserving_ids(sparse_dir / "points3D.bin")
     return SparseScene(cameras=cameras, images=images, points3d=points3d)
 
 
@@ -524,18 +707,15 @@ def compute_scene_bbox(
     return min_xyz - margin, max_xyz + margin
 ```
 
-Note: `third_party/gaussian-splatting` must be on `sys.path` for `scene.colmap_loader` to
-import — Task 1's submodule checkout provides this at the expected relative path.
-
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
 pytest tests/test_colmap_io.py -v
 ```
 
-Expected: `PASS` (3 passed). If `read_extrinsics_binary`/`read_points3D_binary` are missing or
-renamed in the checked-out submodule version, open
-`third_party/gaussian-splatting/scene/colmap_loader.py` and adjust the imported names to match
+Expected: `PASS` (5 passed). If `read_extrinsics_binary`/`read_intrinsics_binary`/`Point3D` are
+missing or renamed in the checked-out submodule version, open
+`third_party/gaussian-splatting/scene/colmap_loader.py` and adjust the referenced names to match
 before re-running.
 
 - [ ] **Step 5: Commit**
@@ -558,8 +738,23 @@ git commit -m "Add COLMAP sparse scene loader and bounding-box computation"
   (Task 4).
 - Produces: `validate_scene(scene: SceneConfig) -> ValidationReport` where `ValidationReport`
   has fields `scene_name: str`, `registered_image_count: int`, `folder_image_count: int`,
-  `missing_images: list[str]`, `extra_images: list[str]`, `test_pose_row_count: int`,
-  `problems: list[str]` (empty means valid).
+  `registered_without_file: list[str]`, `extra_images: list[str]`, `test_pose_row_count: int`,
+  `camera_model: str | None`, `problems: list[str]` (empty means valid).
+
+  **`registered_without_file` is informational, NOT a problem by itself.** Verified against the
+  real dataset: `images.bin` always registers more cameras than are distributed as files in
+  `train/images/` — for `bonsai`/`chair` this set is exactly the scene's `test_poses.csv` image
+  names; for the `HCM*` scenes it's a superset (extra calibration-only frames beyond the test
+  set). This is intentional dataset structure (SfM run over more images than are shipped as
+  training pixels), not data corruption — flagging it as an error would make `validate_scene`
+  reject every single scene in the dataset. `problems` instead covers: `extra_images` (a file
+  present but NOT registered in `images.bin` — this direction IS a real anomaly, e.g. an unused
+  or COLMAP-registration-failed image), missing CSV columns, an unsupported camera model (must
+  be `PINHOLE` or `SIMPLE_PINHOLE`), duplicate `image_name` rows in `test_poses.csv`, non-numeric
+  values in any numeric column, non-positive `width`/`height`, and — the one place
+  `registered_without_file` DOES become a problem — any `test_poses.csv` `image_name` that is
+  NOT found anywhere in `images.bin`'s registered set (would mean the test pose has no
+  corresponding COLMAP camera at all, an actual inconsistency worth flagging).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -576,11 +771,40 @@ def _get_scene(name):
 def test_validate_scene_chair_has_no_problems():
     report = validate_scene(_get_scene("chair"))
     assert report.scene_name == "chair"
-    assert report.registered_image_count == report.folder_image_count
-    assert report.missing_images == []
+    # 263 registered in images.bin, 205 with files on disk — the other 58
+    # are exactly test_poses.csv's image names (verified against the real
+    # data). This is expected dataset structure, not a problem: see the
+    # Interfaces note above.
+    assert report.registered_image_count == 263
+    assert report.folder_image_count == 205
+    assert len(report.registered_without_file) == 58
     assert report.extra_images == []
     assert report.test_pose_row_count == 58
+    assert report.camera_model in {"PINHOLE", "SIMPLE_PINHOLE"}
     assert report.problems == []
+
+
+def test_validate_scene_flags_extra_image_not_registered(tmp_path):
+    # The OTHER direction (a file with no COLMAP registration) IS a real
+    # anomaly and must still be flagged, unlike registered_without_file.
+    # Symlink (not copy) the real files to keep this test fast and cheap.
+    import os
+    from src.common.config import SceneConfig
+
+    real_scene = _get_scene("chair")
+    fake_images_dir = tmp_path / "images"
+    fake_images_dir.mkdir()
+    for p in real_scene.train_images_dir.iterdir():
+        os.symlink(p.resolve(), fake_images_dir / p.name)
+    (fake_images_dir / "not_registered_anywhere.jpg").write_bytes(b"fake")
+
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=fake_images_dir,
+        sparse_dir=real_scene.sparse_dir, test_poses_csv=real_scene.test_poses_csv,
+    )
+    report = validate_scene(scene)
+    assert "not_registered_anywhere.jpg" in report.extra_images
+    assert any("not registered" in p.lower() for p in report.problems)
 
 
 def test_validate_scene_detects_missing_folder_gracefully(tmp_path):
@@ -596,6 +820,87 @@ def test_validate_scene_detects_missing_folder_gracefully(tmp_path):
     report = validate_scene(fake_scene)
     assert report.problems != []
     assert any("sparse" in p.lower() or "not found" in p.lower() for p in report.problems)
+
+
+def _write_test_csv(path, rows):
+    import csv as csv_module
+    with open(path, "w", newline="") as f:
+        writer = csv_module.DictWriter(f, fieldnames=[
+            "image_name", "qw", "qx", "qy", "qz", "tx", "ty", "tz",
+            "fx", "fy", "cx", "cy", "width", "height",
+        ])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _valid_row(name="a.jpg", width=64, height=32):
+    return {
+        "image_name": name, "qw": 1, "qx": 0, "qy": 0, "qz": 0,
+        "tx": 0, "ty": 0, "tz": 0, "fx": 100, "fy": 100, "cx": 32, "cy": 16,
+        "width": width, "height": height,
+    }
+
+
+def test_validate_scene_flags_duplicate_image_name(tmp_path):
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    _write_test_csv(csv_path, [_valid_row("dup.jpg"), _valid_row("dup.jpg")])
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+    # bypass sparse-dir checks by pointing at a scene with valid sparse data
+    real_sparse = _get_scene("chair").sparse_dir
+    real_images = _get_scene("chair").train_images_dir
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_images,
+        sparse_dir=real_sparse, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any("duplicate" in p.lower() for p in report.problems)
+
+
+def test_validate_scene_flags_non_numeric_and_non_positive_dims(tmp_path):
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    bad_row = _valid_row("bad.jpg")
+    bad_row["width"] = "not_a_number"
+    zero_row = _valid_row("zero.jpg", width=0, height=10)
+    _write_test_csv(csv_path, [bad_row, zero_row])
+
+    real_sparse = _get_scene("chair").sparse_dir
+    real_images = _get_scene("chair").train_images_dir
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_images,
+        sparse_dir=real_sparse, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any("bad.jpg" in p and "numeric" in p.lower() for p in report.problems)
+    assert any("zero.jpg" in p and ("width" in p.lower() or "height" in p.lower()) for p in report.problems)
+
+
+def test_validate_scene_flags_test_pose_with_no_colmap_registration(tmp_path):
+    # This IS the one case where a name outside train/images/ is a real
+    # problem: a test pose whose image_name was never registered in
+    # images.bin at all has no corresponding COLMAP camera anywhere.
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    _write_test_csv(csv_path, [_valid_row("totally_unknown_image.jpg")])
+
+    real_scene = _get_scene("chair")
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_scene.train_images_dir,
+        sparse_dir=real_scene.sparse_dir, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any(
+        "totally_unknown_image.jpg" in p and "not registered" in p.lower()
+        for p in report.problems
+    )
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -621,16 +926,41 @@ REQUIRED_CSV_COLUMNS = {
     "image_name", "qw", "qx", "qy", "qz", "tx", "ty", "tz",
     "fx", "fy", "cx", "cy", "width", "height",
 }
+NUMERIC_CSV_COLUMNS = {
+    "qw", "qx", "qy", "qz", "tx", "ty", "tz", "fx", "fy", "cx", "cy", "width", "height",
+}
+SUPPORTED_CAMERA_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 
 
 @dataclass
 class ValidationReport:
+    """Data-quality report for one scene.
+
+    `registered_without_file` is informational only, NOT flagged into
+    `problems` — see its field-level note below for why. This module is a
+    read-only data-quality check; it does not make any scene safe to feed
+    into the real training loader by itself. That's a separate, mandatory
+    step (`build_filtered_scene` in Task 8b), which always strips
+    registered-without-file images before training regardless of what
+    this report says, since the vendored loader crashes on any of them
+    otherwise. Do not treat a clean `ValidationReport` as license to skip
+    that filtering step.
+    """
+
     scene_name: str
     registered_image_count: int = 0
     folder_image_count: int = 0
-    missing_images: list[str] = field(default_factory=list)
+    # Images registered in images.bin with no corresponding file in
+    # train_images_dir. This is normal, intentional dataset structure —
+    # verified across all 7 scenes: always a superset of (often exactly
+    # equal to) the scene's test_poses.csv image names, plus extra
+    # calibration-only frames for some scenes — not data corruption, so it
+    # is never added to `problems`. It is still training-relevant (see
+    # class docstring), just not a data-quality problem.
+    registered_without_file: list[str] = field(default_factory=list)
     extra_images: list[str] = field(default_factory=list)
     test_pose_row_count: int = 0
+    camera_model: str | None = None
     problems: list[str] = field(default_factory=list)
 
 
@@ -650,16 +980,25 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
 
     report.registered_image_count = len(registered_names)
     report.folder_image_count = len(folder_names)
-    report.missing_images = sorted(registered_names - folder_names)
+    # NOT a problem: images.bin legitimately registers more cameras than
+    # are distributed as files (test poses + extra calibration frames) —
+    # see the Interfaces note above. Reported for visibility only.
+    report.registered_without_file = sorted(registered_names - folder_names)
     report.extra_images = sorted(folder_names - registered_names)
 
-    if report.missing_images:
-        report.problems.append(
-            f"{len(report.missing_images)} registered images missing from folder"
-        )
     if report.extra_images:
         report.problems.append(
-            f"{len(report.extra_images)} folder images not registered in images.bin"
+            f"{len(report.extra_images)} folder image(s) not registered in images.bin: "
+            f"{report.extra_images}"
+        )
+
+    camera_models = {cam.model for cam in sparse.cameras.values()}
+    report.camera_model = next(iter(camera_models)) if len(camera_models) == 1 else ",".join(sorted(camera_models))
+    unsupported = camera_models - SUPPORTED_CAMERA_MODELS
+    if unsupported:
+        report.problems.append(
+            f"unsupported camera model(s) {sorted(unsupported)}; "
+            f"baseline expects one of {sorted(SUPPORTED_CAMERA_MODELS)}"
         )
 
     if not scene.test_poses_csv.exists():
@@ -674,8 +1013,47 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
         rows = list(reader)
         report.test_pose_row_count = len(rows)
 
+    seen_names: set[str] = set()
+    for row in rows:
+        name = row.get("image_name", "")
+        if name in seen_names:
+            report.problems.append(f"duplicate image_name in test_poses.csv: {name}")
+        seen_names.add(name)
+
+        # The one direction where a name outside train/images/ IS a
+        # problem: a test pose with no COLMAP registration at all has no
+        # camera to have derived its pose from.
+        if name and name not in registered_names:
+            report.problems.append(
+                f"test pose '{name}' not registered in images.bin (no COLMAP camera for it)"
+            )
+
+        numeric_values = {}
+        for col in NUMERIC_CSV_COLUMNS:
+            raw = row.get(col)
+            try:
+                numeric_values[col] = float(raw)
+            except (TypeError, ValueError):
+                report.problems.append(
+                    f"{name}: column '{col}' is not numeric (got {raw!r})"
+                )
+
+        if "width" in numeric_values and numeric_values["width"] <= 0:
+            report.problems.append(f"{name}: width must be positive, got {numeric_values['width']}")
+        if "height" in numeric_values and numeric_values["height"] <= 0:
+            report.problems.append(f"{name}: height must be positive, got {numeric_values['height']}")
+        for col in ("fx", "fy"):
+            if col in numeric_values and numeric_values[col] <= 0:
+                report.problems.append(f"{name}: {col} must be positive, got {numeric_values[col]}")
+
     return report
 ```
+
+Note: `Camera.model` (from `read_intrinsics_binary`) is expected to already be a string like
+`"PINHOLE"` in the vendored loader's output — if the checked-out submodule version instead
+returns a numeric model id, adjust the `camera_models` comparison to map ids to names via
+`third_party/gaussian-splatting/scene/colmap_loader.py`'s `CAMERA_MODEL_IDS` table before
+re-running the tests.
 
 Create `src/data_validation/__init__.py` (empty).
 
@@ -685,7 +1063,7 @@ Create `src/data_validation/__init__.py` (empty).
 pytest tests/test_validate_scene.py -v
 ```
 
-Expected: `PASS` (2 passed).
+Expected: `PASS` (6 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -742,6 +1120,36 @@ def test_combine_score_clamps_psnr_norm_below_zero():
     assert score == pytest.approx(0.0, abs=1e-10)
 
 
+def test_combine_score_rejects_non_positive_psnr_max():
+    with pytest.raises(ValueError):
+        combine_score(lpips_val=0.1, ssim_val=0.9, psnr_val=20.0, psnr_max=0.0)
+    with pytest.raises(ValueError):
+        combine_score(lpips_val=0.1, ssim_val=0.9, psnr_val=20.0, psnr_max=-5.0)
+
+
+def test_combine_score_importable_without_torch_installed(monkeypatch):
+    # combine_score is the exam's literal grading formula and must stay
+    # auditable/usable without pulling in the full ML stack. Simulate
+    # torch being unavailable and confirm importing the module (and
+    # calling combine_score) still works.
+    import builtins
+    import importlib
+    import sys
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            raise ImportError("simulated: torch not installed")
+        return real_import(name, *args, **kwargs)
+
+    sys.modules.pop("src.evaluation.compute_metrics", None)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    module = importlib.import_module("src.evaluation.compute_metrics")
+    score = module.combine_score(lpips_val=0.1, ssim_val=0.9, psnr_val=30.0, psnr_max=30.0)
+    assert score == pytest.approx(0.4 * 0.9 + 0.3 * 0.9 + 0.3 * 1.0, abs=1e-10)
+
+
 class _StubLpipsModel:
     """Returns 0 distance for identical inputs, 1 otherwise."""
 
@@ -781,23 +1189,33 @@ Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.evaluation'`.
 from __future__ import annotations
 
 import numpy as np
-import torch
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
 def combine_score(lpips_val: float, ssim_val: float, psnr_val: float, psnr_max: float) -> float:
-    """Score = 0.4*(1-LPIPS) + 0.3*SSIM + 0.3*PSNR_norm, PSNR_norm clamped to [0,1]."""
+    """Score = 0.4*(1-LPIPS) + 0.3*SSIM + 0.3*PSNR_norm, PSNR_norm clamped to [0,1].
+
+    Pure function, no torch/skimage dependency, so it stays importable and
+    auditable (this is the exam's literal grading formula) even in a
+    minimal environment that doesn't have the full ML stack installed.
+    """
+    if psnr_max <= 0:
+        raise ValueError(f"psnr_max must be positive, got {psnr_max}")
     psnr_norm = max(0.0, min(1.0, psnr_val / psnr_max))
     return 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
 
 
-def _to_lpips_tensor(img: np.ndarray) -> torch.Tensor:
+def _to_lpips_tensor(img: np.ndarray):
     # (H,W,3) uint8 [0,255] -> (1,3,H,W) float32 in [-1,1], as expected by lpips.LPIPS
+    import torch
+
     t = torch.from_numpy(img).float() / 127.5 - 1.0
     return t.permute(2, 0, 1).unsqueeze(0)
 
 
 def compute_pair_metrics(pred: np.ndarray, gt: np.ndarray, lpips_model) -> dict:
+    import torch
+
     assert pred.shape == gt.shape, f"shape mismatch: {pred.shape} vs {gt.shape}"
 
     ssim_val = structural_similarity(pred, gt, channel_axis=2, data_range=255)
@@ -822,6 +1240,10 @@ def load_lpips_model(net: str = "alex"):
     return model
 ```
 
+`torch` is imported lazily inside the functions that actually need it (not at module level) so
+`combine_score` — the exam's literal grading formula — stays importable without the full ML
+stack installed.
+
 Create `src/evaluation/__init__.py` (empty).
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -830,7 +1252,7 @@ Create `src/evaluation/__init__.py` (empty).
 pytest tests/test_compute_metrics.py -v
 ```
 
-Expected: `PASS` (5 passed).
+Expected: `PASS` (7 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -883,7 +1305,7 @@ def test_select_holdout_picks_farthest_points_from_centroid():
     centers["outlier_1"] = np.array([100.0, 0.0, 0.0])
     centers["outlier_2"] = np.array([-100.0, 0.0, 0.0])
 
-    holdout = select_holdout_images(centers, holdout_ratio=0.2)  # 12 * 0.2 -> 2 (ceil)
+    holdout = select_holdout_images(centers, holdout_ratio=0.2)  # 12 * 0.2 -> 2 (floor)
 
     assert set(holdout) == {"outlier_1", "outlier_2"}
 
@@ -931,7 +1353,7 @@ def select_holdout_images(
     centroid = centers.mean(axis=0)
     distances = np.linalg.norm(centers - centroid, axis=1)
 
-    n_holdout = max(1, math.ceil(len(names) * holdout_ratio))
+    n_holdout = max(1, math.floor(len(names) * holdout_ratio))
     order = np.argsort(-distances)  # descending distance
     return [names[i] for i in order[:n_holdout]]
 ```
@@ -1006,8 +1428,22 @@ def test_build_train_argv_without_resume():
         resume_checkpoint=None,
     )
     assert "--source_path" in argv
-    assert str(scene.root) == argv[argv.index("--source_path") + 1]
+    source_path_arg = argv[argv.index("--source_path") + 1]
+    # Must be absolute: the manual Colab step (Task 8 Step 6) runs the
+    # subprocess with cwd="third_party/gaussian-splatting", so a relative
+    # path would resolve against the wrong directory and silently fail to
+    # find the dataset. Must be scene.gs_source_dir, NOT scene.root: the
+    # real dataset nests images/ and sparse/0/ one level deeper
+    # (<scene>/train/...) than the baseline's expected --source_path
+    # layout (<source_path>/images/, <source_path>/sparse/0/ as direct
+    # children) — passing scene.root here would point train.py at a
+    # directory with no images/ subfolder at all.
+    assert Path(source_path_arg).is_absolute()
+    assert Path(source_path_arg) == scene.gs_source_dir.resolve()
+    assert Path(source_path_arg) != scene.root.resolve()
     assert "--model_path" in argv
+    model_path_arg = argv[argv.index("--model_path") + 1]
+    assert Path(model_path_arg).is_absolute()
     assert "--iterations" in argv
     assert "30000" in argv
     assert "--start_checkpoint" not in argv
@@ -1027,7 +1463,9 @@ def test_build_train_argv_with_resume_checkpoint():
         resume_checkpoint=ckpt,
     )
     assert "--start_checkpoint" in argv
-    assert str(ckpt) == argv[argv.index("--start_checkpoint") + 1]
+    ckpt_arg = argv[argv.index("--start_checkpoint") + 1]
+    assert Path(ckpt_arg).is_absolute()
+    assert Path(ckpt_arg) == ckpt.resolve()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1073,15 +1511,35 @@ def build_train_argv(
     resume_checkpoint: Path | None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
+    """Build the argv for invoking the vendored train.py.
+
+    All paths are resolved to absolute before being placed in argv. The
+    manual Colab verification step (Task 8 Step 6) invokes this via
+    `subprocess.run(argv, cwd="third_party/gaussian-splatting")` — a
+    relative path would silently resolve against that cwd instead of the
+    caller's working directory, pointing at a nonexistent dataset path.
+
+    --source_path is `scene.gs_source_dir`, NOT `scene.root`: the baseline
+    requires `<source_path>/images/` and `<source_path>/sparse/0/` as
+    direct children, but the real dataset nests these under `<scene>/
+    train/`. `gs_source_dir` resolves this correctly for both the raw
+    dataset layout and a Task 8b filtered scene copy (see its docstring in
+    Task 2).
+    """
     argv = [
         "python", "train.py",
-        "--source_path", str(scene.root),
-        "--model_path", str(output_dir),
+        "--source_path", str(Path(scene.gs_source_dir).resolve()),
+        "--model_path", str(Path(output_dir).resolve()),
         "--iterations", str(iterations),
-        "--eval",
     ]
+    # Deliberately no --eval flag: the baseline's own --eval does an
+    # internal 1/8-uniform-holdout split, which would (a) double-filter an
+    # already-holdout-excluded scene when called on the Task 8b filtered
+    # copy, and (b) needlessly shrink the training set when called on the
+    # full scene for the final submission checkpoint. Holdout exclusion is
+    # handled entirely by Task 8b before this function is ever called.
     if resume_checkpoint is not None:
-        argv += ["--start_checkpoint", str(resume_checkpoint)]
+        argv += ["--start_checkpoint", str(Path(resume_checkpoint).resolve())]
     if extra_args:
         argv += extra_args
     return argv
@@ -1124,6 +1582,291 @@ subprocess.run(argv, cwd="third_party/gaussian-splatting", check=True)
 Expected: training starts (or resumes from `ckpt` if the cell is re-run after a disconnect),
 writes `chkpntNNNN.pth` files into `output_dir` on Drive, and logs loss decreasing over
 iterations.
+
+---
+
+### Task 8b: Leak-free holdout scene builder
+
+**Why this task exists:** `select_holdout_images` (Task 7) picks holdout image names, but
+nothing so far actually removes those images from what `train.py` trains on. Passing `--eval`
+to the baseline (as Task 8 originally did) does **not** honor our holdout list — it applies the
+baseline's own internal 1/8-uniform split, which is a different, uncontrolled set of images.
+Evaluating "holdout" metrics on a checkpoint that was actually trained on those same images is
+data leakage: the reported score would be systematically optimistic and untrustworthy for
+picking hyperparameters. Task 8's `build_train_argv` was already changed to drop `--eval`
+entirely — this task provides the real mechanism: physically construct a scene copy that
+excludes the holdout images before training ever sees them.
+
+**Files:**
+- Create: `src/training/colmap_writer.py`
+- Create: `src/training/holdout_scene.py`
+- Test: `tests/test_holdout_scene.py`
+
+**Interfaces:**
+- Consumes: `src.common.colmap_io.load_sparse_scene` (Task 4), `src.common.config.SceneConfig`
+  (Task 2).
+- Produces:
+  - `write_images_binary(images: dict, path: Path) -> None` — writes a COLMAP `images.bin`
+    containing exactly the given images, in the same binary layout consumed by the vendored
+    `scene/colmap_loader.py::read_extrinsics_binary`. Point2D track data is intentionally
+    omitted (`num_points2D` written as `0` for every image) since the baseline `train.py` does
+    not consume per-image point tracks — only pose, camera_id, and name are needed for
+    training. Correctness is verified by **round-trip with the same reader training will use**
+    (see Step 1's test), not by matching COLMAP's own writer byte-for-byte.
+  - `build_filtered_scene(scene: SceneConfig, holdout_names: set[str], output_dir: Path) -> SceneConfig`
+    — creates `output_dir/images/` (symlinks to the original files for every kept image, to
+    avoid duplicating image bytes), `output_dir/sparse/0/{cameras.bin,points3D.bin}` (copied
+    unchanged — intrinsics and the 3D point cloud don't depend on which images are held out),
+    and `output_dir/sparse/0/images.bin` (rewritten to contain only kept images). Returns a new
+    `SceneConfig` pointing at `output_dir`, suitable for passing straight into `build_train_argv`
+    or the real `Scene()` loader.
+
+  **Always excludes registered-without-file images too, in addition to `holdout_names` — this
+  is not optional.** Verified against the real dataset (see Task 4/5): `images.bin` registers
+  more cameras than there are files in `train_images_dir` for every scene (test poses, and for
+  the `HCM*` scenes, extra calibration-only frames). The vendored `utils/camera_utils.py::
+  loadCam` does `Image.open(cam_info.image_path)` with no error handling at all — if a scene
+  with `dataset.eval=False` (which this whole plan uses, since holdout is handled here rather
+  than by the baseline's own `--eval`) is loaded with any registered-without-file image still
+  present, training crashes the first time it happens to sample that camera. So
+  `build_filtered_scene(scene, set(), output_dir)` (empty holdout) is not a no-op — it is the
+  **minimum required filtering** before a scene may ever be passed to the real training loader,
+  used for the "full data" final-training phase in Task 12 exactly as much as for the eval
+  phase.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_holdout_scene.py
+from pathlib import Path
+
+import numpy as np
+
+from src.common.colmap_io import load_sparse_scene
+from src.common.config import load_scenes
+from src.training.colmap_writer import write_images_binary
+from src.training.holdout_scene import build_filtered_scene
+
+
+def _get_scene(name):
+    return next(s for s in load_scenes("configs/scenes.yaml") if s.name == name)
+
+
+def test_write_images_binary_round_trips_with_the_vendored_reader(tmp_path):
+    scene = _get_scene("chair")
+    sparse = load_sparse_scene(scene.sparse_dir)
+    # keep just the first 5 images so the test is fast
+    subset = dict(list(sparse.images.items())[:5])
+
+    out_path = tmp_path / "images.bin"
+    write_images_binary(subset, out_path)
+
+    reloaded = load_sparse_scene.__globals__["read_extrinsics_binary"](str(out_path))
+    assert set(reloaded.keys()) == set(subset.keys())
+    for image_id, original in subset.items():
+        round_tripped = reloaded[image_id]
+        assert round_tripped.name == original.name
+        assert round_tripped.camera_id == original.camera_id
+        np.testing.assert_allclose(round_tripped.qvec, original.qvec, atol=1e-9)
+        np.testing.assert_allclose(round_tripped.tvec, original.tvec, atol=1e-9)
+
+
+def _file_backed_names(scene) -> set[str]:
+    import os
+    return set(os.listdir(scene.train_images_dir))
+
+
+def test_build_filtered_scene_excludes_holdout_images_from_bin_and_folder(tmp_path):
+    scene = _get_scene("chair")
+    sparse = load_sparse_scene(scene.sparse_dir)
+    file_backed = sorted(_file_backed_names(scene))  # only names with a real file
+    holdout = set(file_backed[:5])
+
+    filtered = build_filtered_scene(scene, holdout, tmp_path / "filtered_chair")
+
+    filtered_sparse = load_sparse_scene(filtered.sparse_dir)
+    filtered_names = {img.name for img in filtered_sparse.images.values()}
+
+    # Expected kept set: file-backed names minus the chosen holdout.
+    # Registered-without-file names (e.g. test_poses.csv images) must be
+    # gone too even though they were never in `holdout`.
+    assert filtered_names == set(file_backed) - holdout
+    registered_without_file = {img.name for img in sparse.images.values()} - set(file_backed)
+    assert registered_without_file, "test fixture assumption broken: chair should have some"
+    assert filtered_names.isdisjoint(registered_without_file)
+
+    for name in filtered_names:
+        assert (filtered.train_images_dir / name).exists()
+    for name in holdout:
+        assert not (filtered.train_images_dir / name).exists()
+    for name in registered_without_file:
+        assert not (filtered.train_images_dir / name).exists()
+
+    # cameras.bin and points3D.bin are carried over unchanged
+    assert (filtered.sparse_dir / "cameras.bin").read_bytes() == \
+        (scene.sparse_dir / "cameras.bin").read_bytes()
+    assert (filtered.sparse_dir / "points3D.bin").read_bytes() == \
+        (scene.sparse_dir / "points3D.bin").read_bytes()
+
+    # retained images keep identical pose data (no silent corruption)
+    orig_by_name = {img.name: img for img in sparse.images.values()}
+    filt_by_name = {img.name: img for img in filtered_sparse.images.values()}
+    for name in filtered_names:
+        np.testing.assert_allclose(orig_by_name[name].qvec, filt_by_name[name].qvec, atol=1e-9)
+        np.testing.assert_allclose(orig_by_name[name].tvec, filt_by_name[name].tvec, atol=1e-9)
+
+
+def test_build_filtered_scene_excludes_registered_without_file_even_with_empty_holdout(tmp_path):
+    # This is the exact case Task 12's "final full training" phase relies
+    # on: build_filtered_scene(scene, set(), ...) must still be safe to
+    # feed into the real Scene()/train.py loader, i.e. it must never leave
+    # a registered-without-file image (like a test_poses.csv image) in the
+    # output, even though holdout_names is empty.
+    scene = _get_scene("chair")
+    sparse = load_sparse_scene(scene.sparse_dir)
+    file_backed = _file_backed_names(scene)
+    registered_without_file = {img.name for img in sparse.images.values()} - file_backed
+    assert registered_without_file  # fixture sanity: chair has 58 of these
+
+    filtered = build_filtered_scene(scene, set(), tmp_path / "filtered_chair_full")
+
+    filtered_sparse = load_sparse_scene(filtered.sparse_dir)
+    filtered_names = {img.name for img in filtered_sparse.images.values()}
+    assert filtered_names == file_backed
+    assert filtered_names.isdisjoint(registered_without_file)
+    for name in filtered_names:
+        assert (filtered.train_images_dir / name).exists()
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+pytest tests/test_holdout_scene.py -v
+```
+
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.training.colmap_writer'`.
+
+- [ ] **Step 3: Write `src/training/colmap_writer.py`**
+
+```python
+from __future__ import annotations
+
+import struct
+from pathlib import Path
+
+
+def write_images_binary(images: dict, path: Path) -> None:
+    """Write a COLMAP images.bin containing exactly the given images.
+
+    `images` maps image_id -> an object with `.qvec` (length-4 array,
+    [qw,qx,qy,qz]), `.tvec` (length-3 array), `.camera_id` (int), `.name`
+    (str) — i.e. the same shape as entries returned by
+    scene/colmap_loader.py::read_extrinsics_binary in the vendored repo.
+
+    Per-image point2D track data is not supported by this writer:
+    num_points2D is always written as 0. This is safe for this pipeline
+    because the baseline train.py never reads point2D tracks from
+    images.bin, only pose/camera_id/name.
+    """
+    path = Path(path)
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(images)))
+        for image_id, img in images.items():
+            fid.write(struct.pack(
+                "<idddddddi",
+                int(image_id),
+                float(img.qvec[0]), float(img.qvec[1]), float(img.qvec[2]), float(img.qvec[3]),
+                float(img.tvec[0]), float(img.tvec[1]), float(img.tvec[2]),
+                int(img.camera_id),
+            ))
+            fid.write(img.name.encode("utf-8") + b"\x00")
+            fid.write(struct.pack("<Q", 0))  # num_points2D
+```
+
+- [ ] **Step 4: Write `src/training/holdout_scene.py`**
+
+```python
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import replace
+from pathlib import Path
+
+from src.common.colmap_io import load_sparse_scene
+from src.common.config import SceneConfig
+from src.training.colmap_writer import write_images_binary
+
+
+def build_filtered_scene(
+    scene: SceneConfig, holdout_names: set[str], output_dir: Path,
+) -> SceneConfig:
+    """Create a copy of `scene` with every image in `holdout_names` EXCLUDED
+    from both the images folder and sparse/0/images.bin, so training on the
+    returned SceneConfig cannot see the holdout images at all.
+
+    ALSO always excludes any image registered in images.bin that has no
+    corresponding file in scene.train_images_dir, regardless of
+    holdout_names — this is not optional (see Interfaces note above): the
+    real dataset always registers more cameras than it distributes files
+    for, and the vendored loader crashes on `Image.open()` for any of
+    them. Calling this with `holdout_names=set()` is the correct way to
+    get a "full data" scene that is still safe to train on.
+    """
+    output_dir = Path(output_dir)
+    images_out = output_dir / "images"
+    sparse_out = output_dir / "sparse" / "0"
+    images_out.mkdir(parents=True, exist_ok=True)
+    sparse_out.mkdir(parents=True, exist_ok=True)
+
+    sparse = load_sparse_scene(scene.sparse_dir)
+    file_backed_names = {p.name for p in scene.train_images_dir.iterdir() if p.is_file()}
+    exclude = set(holdout_names) | (
+        {img.name for img in sparse.images.values()} - file_backed_names
+    )
+    kept_images = {
+        img_id: img for img_id, img in sparse.images.items()
+        if img.name not in exclude
+    }
+
+    for img in kept_images.values():
+        src = (scene.train_images_dir / img.name).resolve()
+        dst = images_out / img.name
+        if not dst.exists():
+            os.symlink(src, dst)
+
+    write_images_binary(kept_images, sparse_out / "images.bin")
+    shutil.copy2(scene.sparse_dir / "cameras.bin", sparse_out / "cameras.bin")
+    shutil.copy2(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
+
+    return replace(
+        scene,
+        root=output_dir,
+        train_images_dir=images_out,
+        sparse_dir=sparse_out,
+    )
+```
+
+Create `src/training/__init__.py` if not already present from Task 8.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+```bash
+pytest tests/test_holdout_scene.py -v
+```
+
+Expected: `PASS` (2 passed). If the round-trip test fails on the fixed-header unpack, open
+`third_party/gaussian-splatting/scene/colmap_loader.py::read_extrinsics_binary` and confirm the
+exact `format_char_sequence` used for the 64-byte per-image header — adjust the `"<idddddddi"`
+struct format in `write_images_binary` to match exactly if the checked-out submodule version
+differs.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/training/colmap_writer.py src/training/holdout_scene.py tests/test_holdout_scene.py
+git commit -m "Add leak-free holdout scene builder (physically excludes holdout images before training)"
+```
 
 ---
 
@@ -1180,11 +1923,48 @@ def test_render_all_writes_one_png_per_row_with_correct_name_and_size(tmp_path):
 
     assert len(written) == 3
     for path, params in zip(written, params_list):
-        assert path.name == params.image_name.rsplit(".", 1)[0] + ".png"
+        # Filename must match test_poses.csv image_name EXACTLY, including
+        # its original extension — the exam spec (debai.md section 1.4)
+        # says image_name IS the required output filename; nothing in the
+        # spec asks for extension normalization to .png, and the real CSVs
+        # use .jpg/.JPG.
+        assert path.name == params.image_name
         assert path.exists()
         from PIL import Image
         img = Image.open(path)
         assert img.size == (params.width, params.height)
+
+
+def test_render_all_preserves_uppercase_jpg_extension_from_real_drone_naming():
+    # Real HCM scene CSVs use names like DJI_20241230093428_0050_V.JPG —
+    # this must round-trip exactly, not get rewritten to .png.
+    from src.common.pose_utils import CameraParams
+    import numpy as np
+
+    params = CameraParams(
+        image_name="DJI_20241230093428_0050_V.JPG",
+        R=np.eye(3), T=np.zeros(3), fov_x=1.0, fov_y=1.0, width=8, height=4,
+    )
+
+    def fake_render_fn(camera_params, gaussians):
+        return np.zeros((camera_params.height, camera_params.width, 3), dtype=np.uint8)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        written = render_all(
+            checkpoint_ply=None, csv_path=None, output_dir=Path(tmp),
+            render_fn=fake_render_fn, params_list=[params],
+        )
+        assert written[0].name == "DJI_20241230093428_0050_V.JPG"
+
+
+def test_pil_save_kwargs_maximizes_jpeg_quality_but_leaves_png_alone():
+    from src.rendering.render_from_csv import _pil_save_kwargs
+
+    assert _pil_save_kwargs(Path("a.JPG")) == {"quality": 100, "subsampling": 0}
+    assert _pil_save_kwargs(Path("a.jpg")) == {"quality": 100, "subsampling": 0}
+    assert _pil_save_kwargs(Path("a.jpeg")) == {"quality": 100, "subsampling": 0}
+    assert _pil_save_kwargs(Path("a.png")) == {}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1215,6 +1995,20 @@ def load_test_poses_csv(csv_path: Path) -> list[CameraParams]:
         return [camera_params_from_csv_row(row) for row in reader]
 
 
+def _pil_save_kwargs(out_path: Path) -> dict:
+    """Extra kwargs for Image.save() to avoid unnecessary lossy artifacts.
+
+    Only JPEG needs this: at PIL's default quality=75, re-compressing an
+    already-rendered image throws away detail that directly lowers
+    PSNR/SSIM/LPIPS for no reason. quality=100 + subsampling=0 (4:4:4, no
+    chroma subsampling) keeps JPEG output as close to lossless as the
+    format allows. PNG is lossless by default and needs no extra kwargs.
+    """
+    if out_path.suffix.lower() in (".jpg", ".jpeg"):
+        return {"quality": 100, "subsampling": 0}
+    return {}
+
+
 def render_all(
     checkpoint_ply,
     csv_path,
@@ -1224,9 +2018,14 @@ def render_all(
     gaussians=None,
 ) -> list[Path]:
     """Render every camera in params_list (or loaded from csv_path if
-    params_list is None) and write one PNG per row into output_dir, named
-    after the CSV's image_name (extension normalized to .png per the
-    submission format in spec section 14).
+    params_list is None) and write one image per row into output_dir, named
+    with the EXACT `image_name` string from test_poses.csv (original
+    extension preserved, e.g. `.JPG`/`.jpg` — never rewritten to `.png`).
+    PIL infers the output format from the filename extension. For
+    JPEG-extension outputs, quality/subsampling are maximized (see
+    `_pil_save_kwargs`) since our rendered pixels are already the best the
+    model can produce — any avoidable lossy re-compression only throws away
+    PSNR/SSIM/LPIPS score for no benefit.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,9 +2040,10 @@ def render_all(
             f"{params.image_name}: expected {(params.height, params.width, 3)}, "
             f"got {img_array.shape}"
         )
-        out_name = params.image_name.rsplit(".", 1)[0] + ".png"
-        out_path = output_dir / out_name
-        Image.fromarray(img_array.astype(np.uint8)).save(out_path)
+        out_path = output_dir / params.image_name
+        Image.fromarray(img_array.astype(np.uint8)).save(
+            out_path, **_pil_save_kwargs(out_path),
+        )
         written.append(out_path)
     return written
 ```
@@ -1256,7 +2056,7 @@ Create `src/rendering/__init__.py` (empty).
 pytest tests/test_render_from_csv.py -v
 ```
 
-Expected: `PASS` (2 passed).
+Expected: `PASS` (4 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -1298,8 +2098,8 @@ render_all(
 )
 ```
 
-Expected: 58 PNG files written, filenames matching `test_poses.csv` `image_name` (with `.png`
-extension), sizes matching each row's `width x height`. The `pipe=...` argument must be filled
+Expected: 58 image files written, filenames matching `test_poses.csv` `image_name` exactly
+(original extension preserved), sizes matching each row's `width x height`. The `pipe=...` argument must be filled
 with the vendored repo's `PipelineParams` default instance — check
 `third_party/gaussian-splatting/arguments/__init__.py` for the exact constructor signature
 before running, since it may differ slightly across submodule versions.
@@ -1314,8 +2114,10 @@ before running, since it may differ slightly across submodule versions.
 
 **Interfaces:**
 - Produces: `package_submission(scene_render_dirs: dict[str, Path], output_zip: Path) -> Path`
-  — `scene_render_dirs` maps scene name -> directory of rendered PNGs; writes
-  `scene_XXX/<image_name>` entries into `output_zip` per spec section 14 / đề bài mục 7.
+  — `scene_render_dirs` maps `scene.effective_submission_dir` (Task 2) -> directory of rendered
+  images; writes `<submission_dir>/<image_name>` entries into `output_zip` per spec section 14 /
+  đề bài mục 7, using each file's name exactly as it was written by `render_all` (Task 9) —
+  no renaming happens in this function.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1470,6 +2272,25 @@ def test_validate_submission_passes_for_correct_zip(tmp_path):
     assert problems == []
 
 
+def test_validate_submission_preserves_original_extension_not_forced_to_png(tmp_path):
+    # image_name in the CSV keeps its real extension (.JPG here, matching
+    # the real HCM drone scenes) — validator must look for that exact name,
+    # not silently expect a renamed .png.
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("DJI_20241230093428_0050_V.JPG", width=64, height=32)])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/DJI_20241230093428_0050_V.JPG", _make_png_bytes(64, 32))
+
+    problems = validate_submission(zip_path, [scene])
+    assert problems == []
+
+
 def test_validate_submission_flags_missing_image(tmp_path):
     csv_path = tmp_path / "scene_a_test_poses.csv"
     _write_csv(csv_path, [_make_row("0001.png"), _make_row("0002.png")])
@@ -1517,6 +2338,95 @@ def test_validate_submission_flags_missing_scene_entirely(tmp_path):
 
     problems = validate_submission(zip_path, [scene])
     assert any("scene_a" in p for p in problems)
+
+
+def test_validate_submission_uses_effective_submission_dir_not_scene_name(tmp_path):
+    # scene.name (internal dataset id) can differ from the folder name
+    # required inside submission.zip — validator must key off
+    # effective_submission_dir, not name.
+    csv_path = tmp_path / "test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png")])
+    scene = SceneConfig(
+        name="HCM0421", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path, submission_dir="scene_001",
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_001/0001.png", _make_png_bytes(64, 32))
+
+    problems = validate_submission(zip_path, [scene])
+    assert problems == []
+
+
+def test_validate_submission_flags_extra_image_within_a_scene(tmp_path):
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png")])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/0001.png", _make_png_bytes(64, 32))
+        zf.writestr("scene_a/9999.png", _make_png_bytes(64, 32))  # not in test_poses.csv
+
+    problems = validate_submission(zip_path, [scene])
+    assert any("9999.png" in p and "unexpected" in p.lower() for p in problems)
+
+
+def test_validate_submission_flags_extra_top_level_scene_not_in_expected_list(tmp_path):
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png")])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/0001.png", _make_png_bytes(64, 32))
+        zf.writestr("scene_zzz_not_expected/0001.png", _make_png_bytes(64, 32))
+
+    problems = validate_submission(zip_path, [scene])
+    assert any("scene_zzz_not_expected" in p and "unexpected" in p.lower() for p in problems)
+
+
+def test_validate_submission_flags_junk_files_like_macosx(tmp_path):
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png")])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/0001.png", _make_png_bytes(64, 32))
+        zf.writestr("__MACOSX/scene_a/._0001.png", b"junk")
+
+    problems = validate_submission(zip_path, [scene])
+    assert any("__MACOSX" in p and "unexpected" in p.lower() for p in problems)
+
+
+def test_validate_submission_ignores_pure_directory_entries(tmp_path):
+    # zip directory marker entries (ending in "/") are not real files and
+    # must not be flagged as unexpected — only actual file entries count.
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png")])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/", b"")  # directory marker
+        zf.writestr("scene_a/0001.png", _make_png_bytes(64, 32))
+
+    problems = validate_submission(zip_path, [scene])
+    assert problems == []
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1543,32 +2453,52 @@ from src.rendering.render_from_csv import load_test_poses_csv
 
 
 def validate_submission(zip_path: Path, scenes: list[SceneConfig]) -> list[str]:
+    """Validate zip contents against exactly what test_poses.csv expects
+    across all `scenes` — flags both MISSING files (Task 11 original scope)
+    and UNEXPECTED files (extra images, extra top-level scene directories,
+    junk like __MACOSX/, wrong scene naming) since the exam explicitly says
+    both missing AND extra scenes/files void the score (debai.md section
+    1.6 / 8.4).
+    """
     problems: list[str] = []
     zip_path = Path(zip_path)
 
     with zipfile.ZipFile(zip_path) as zf:
-        names_in_zip = set(zf.namelist())
+        # Directory marker entries (name ends in "/") aren't real files.
+        file_names_in_zip = {n for n in zf.namelist() if not n.endswith("/")}
+        accounted_for: set[str] = set()
 
         for scene in scenes:
+            submission_dir = scene.effective_submission_dir
             expected_params = load_test_poses_csv(scene.test_poses_csv)
-            scene_entries = [n for n in names_in_zip if n.startswith(f"{scene.name}/")]
+            scene_entries = [n for n in file_names_in_zip if n.startswith(f"{submission_dir}/")]
             if not scene_entries:
-                problems.append(f"scene '{scene.name}': no files found in zip")
+                problems.append(f"scene '{submission_dir}': no files found in zip")
                 continue
 
             for params in expected_params:
-                out_name = params.image_name.rsplit(".", 1)[0] + ".png"
-                arcname = f"{scene.name}/{out_name}"
-                if arcname not in names_in_zip:
-                    problems.append(f"scene '{scene.name}': missing {out_name}")
+                # Use image_name exactly as given — never renamed to .png.
+                arcname = f"{submission_dir}/{params.image_name}"
+                if arcname not in file_names_in_zip:
+                    problems.append(f"scene '{submission_dir}': missing {params.image_name}")
                     continue
+                accounted_for.add(arcname)
                 data = zf.read(arcname)
                 with Image.open(BytesIO(data)) as img:
                     if img.size != (params.width, params.height):
                         problems.append(
-                            f"scene '{scene.name}': {out_name} has wrong size "
+                            f"scene '{submission_dir}': {params.image_name} has wrong size "
                             f"{img.size}, expected {(params.width, params.height)}"
                         )
+
+        # Anything in the zip that wasn't matched to an expected file above
+        # is unexpected: extra images within a known scene, an entire
+        # top-level scene directory not in `scenes` at all, or junk like
+        # __MACOSX/ or .DS_Store added by some zip tools. The exam voids
+        # the whole score for extra/missing scenes, so this must be caught
+        # locally before submitting, not discovered after scoring.
+        for extra in sorted(file_names_in_zip - accounted_for):
+            problems.append(f"unexpected file in submission zip: {extra}")
 
     return problems
 ```
@@ -1579,7 +2509,7 @@ def validate_submission(zip_path: Path, scenes: list[SceneConfig]) -> list[str]:
 pytest tests/test_validate_submission.py -v
 ```
 
-Expected: `PASS` (4 passed).
+Expected: `PASS` (10 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -1597,14 +2527,30 @@ git commit -m "Add submission validator to prevent missing/mis-sized scene rejec
 - Test: `tests/test_run_pipeline.py`
 
 **Interfaces:**
-- Consumes: `validate_scene` (Task 5), `select_holdout_images` (Task 7), `compute_pair_metrics`
-  + `combine_score` (Task 6), `package_submission` (Task 10), `validate_submission` (Task 11).
-- Produces: `run_baseline_pipeline(scenes: list[SceneConfig], train_fn, render_fn, psnr_max: float, output_root: Path) -> PipelineResult`
-  where `train_fn(scene, output_dir) -> Path` (returns checkpoint path) and
-  `render_fn(checkpoint, params_list, output_dir) -> list[Path]` are injected, so the ordering
-  and error-aggregation logic is testable without a GPU. `PipelineResult` has fields
-  `per_scene_scores: dict[str, float]`, `validation_problems: list[str]`,
-  `submission_zip: Path | None`.
+- Consumes: `validate_scene` (Task 5), `select_holdout_images` (Task 7), `build_filtered_scene`
+  (Task 8b), `compute_pair_metrics` + `combine_score` (Task 6), `package_submission` (Task 10),
+  `validate_submission` (Task 11).
+- Produces: `run_baseline_pipeline(scenes: list[SceneConfig], train_fn, render_fn, lpips_model, psnr_max: float, output_root: Path) -> PipelineResult`
+  where `train_fn(scene, output_dir) -> Path` (returns checkpoint path),
+  `render_fn(checkpoint, params_list, output_dir) -> list[Path]`, and `lpips_model` (any object
+  callable as `lpips_model(pred_tensor, gt_tensor) -> torch.Tensor`, same contract as Task 6)
+  are all injected, so the ordering and error-aggregation logic is testable without a GPU **and
+  without network access** — tests pass the `_StubLpipsModel` from Task 6 instead of the real
+  network, which `load_lpips_model()` would otherwise download on every test run. `PipelineResult`
+  has fields `per_scene_scores: dict[str, float]`, `skipped_scenes: dict[str, list[str]]`
+  (scene name -> `validate_scene` problems, for scenes skipped before spending any GPU time),
+  `validation_problems: list[str]`, `submission_zip: Path | None`.
+- **`validate_scene` (Task 5) runs before training, not after**: for each scene, if
+  `validate_scene(scene).problems` is non-empty, the scene is recorded in
+  `result.skipped_scenes` and both training phases are skipped entirely — training on a scene
+  with e.g. missing images or an unsupported camera model would burn GPU time on Colab only to
+  fail partway through or produce garbage.
+- **Two training runs per scene, not one** (this is the leak fix from Task 8b): `train_fn` is
+  called once on a `build_filtered_scene` copy (holdout images physically excluded) to produce
+  an `eval_checkpoint` used only for holdout scoring, and once on the original, unfiltered
+  `scene` to produce a `final_checkpoint` used only for rendering the real `test_poses.csv`
+  submission. The two checkpoints are never swapped — scoring an unbiased checkpoint and
+  shipping the best-data checkpoint are different goals and must not share a model.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1613,6 +2559,7 @@ git commit -m "Add submission validator to prevent missing/mis-sized scene rejec
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from src.common.config import SceneConfig
 from src.orchestrator.run_pipeline import run_baseline_pipeline
@@ -1625,42 +2572,151 @@ def _chair_scene():
         train_images_dir=Path("VAI_NVS_DATA_ROUND2/chair/train/images"),
         sparse_dir=Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0"),
         test_poses_csv=Path("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv"),
+        submission_dir="chair",
     )
+
+
+class _StubLpipsModel:
+    """Same stub as Task 6 — avoids downloading real AlexNet weights just
+    to test orchestration wiring, which needs no network access."""
+
+    def __call__(self, pred_tensor, gt_tensor):
+        identical = torch.allclose(pred_tensor, gt_tensor)
+        return torch.tensor(0.0 if identical else 1.0)
+
+
+def _fake_render_fn(checkpoint, params_list, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for params in params_list:
+        from PIL import Image
+        path = output_dir / params.image_name
+        Image.fromarray(
+            np.zeros((params.height, params.width, 3), dtype=np.uint8)
+        ).save(path)
+        written.append(path)
+    return written
 
 
 def test_run_baseline_pipeline_produces_scores_and_valid_zip(tmp_path):
     scene = _chair_scene()
+    train_calls = []
 
-    def fake_train_fn(scene, output_dir):
-        return output_dir / "fake_checkpoint.pth"
-
-    def fake_render_fn(checkpoint, params_list, output_dir):
+    def fake_train_fn(scene_arg, output_dir):
+        train_calls.append(Path(scene_arg.root).resolve())
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        written = []
-        for params in params_list:
-            from PIL import Image
-            path = output_dir / (params.image_name.rsplit(".", 1)[0] + ".png")
-            Image.fromarray(
-                np.zeros((params.height, params.width, 3), dtype=np.uint8)
-            ).save(path)
-            written.append(path)
-        return written
+        ckpt = output_dir / "fake_checkpoint.pth"
+        ckpt.touch()
+        return ckpt
 
     result = run_baseline_pipeline(
         scenes=[scene],
         train_fn=fake_train_fn,
-        render_fn=fake_render_fn,
+        render_fn=_fake_render_fn,
+        lpips_model=_StubLpipsModel(),
         psnr_max=30.0,
         output_root=tmp_path,
     )
 
+    # train_fn must be called exactly twice, and NEITHER call may use the
+    # original scene.root directly: images.bin registers more cameras than
+    # have files on disk for this dataset (test_poses.csv images among
+    # them), and the real loader crashes on any of them — so Phase A (
+    # holdout-excluded) and Phase B (empty-holdout "full data") must BOTH
+    # go through build_filtered_scene into a distinct scratch directory,
+    # proving the leak-free AND crash-free wiring from Task 8b is actually
+    # used for both phases, not just defined and ignored for one of them.
+    assert len(train_calls) == 2
+    original_root = Path(scene.root).resolve()
+    assert original_root not in train_calls, (
+        "both phases must pass a build_filtered_scene copy, never the raw "
+        "scene.root, since images.bin registers images with no file on disk"
+    )
+    assert train_calls[0] != train_calls[1], (
+        "Phase A (holdout-excluded) and Phase B (full data) must use distinct scene copies"
+    )
+
+    assert result.skipped_scenes == {}
     assert "chair" in result.per_scene_scores
     assert 0.0 <= result.per_scene_scores["chair"] <= 1.0
     assert result.submission_zip is not None
     assert result.submission_zip.exists()
     # black-image render vs real holdout images should not be a perfect score
     assert result.per_scene_scores["chair"] < 0.9
+
+
+def test_run_baseline_pipeline_skips_invalid_scene_without_calling_train_fn(tmp_path):
+    broken_scene = SceneConfig(
+        name="broken",
+        root=tmp_path / "broken",
+        train_images_dir=tmp_path / "broken" / "does_not_exist",
+        sparse_dir=tmp_path / "broken" / "also_missing",
+        test_poses_csv=tmp_path / "broken" / "test_poses.csv",
+        submission_dir="broken",
+    )
+    train_calls = []
+
+    def fake_train_fn(scene_arg, output_dir):
+        train_calls.append(scene_arg)
+        raise AssertionError("train_fn must not be called for an invalid scene")
+
+    result = run_baseline_pipeline(
+        scenes=[broken_scene],
+        train_fn=fake_train_fn,
+        render_fn=_fake_render_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        output_root=tmp_path,
+    )
+
+    assert train_calls == []
+    assert "broken" in result.skipped_scenes
+    assert result.skipped_scenes["broken"] != []
+    assert "broken" not in result.per_scene_scores
+    # Fail-closed: a skipped scene must withhold the whole submission, not
+    # just omit that scene from an otherwise-produced zip. The exam voids
+    # the ENTIRE score for a missing scene (debai.md section 1.6/8.4), so
+    # packaging a zip that's already known to be incomplete would be worse
+    # than not packaging one at all.
+    assert result.submission_zip is None
+    assert any("broken" in p and "skipped" in p.lower() for p in result.validation_problems)
+
+
+def test_run_baseline_pipeline_withholds_submission_even_if_other_scenes_succeed(tmp_path):
+    good_scene = _chair_scene()
+    broken_scene = SceneConfig(
+        name="broken",
+        root=tmp_path / "broken",
+        train_images_dir=tmp_path / "broken" / "does_not_exist",
+        sparse_dir=tmp_path / "broken" / "also_missing",
+        test_poses_csv=tmp_path / "broken" / "test_poses.csv",
+        submission_dir="broken",
+    )
+
+    def fake_train_fn(scene_arg, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = output_dir / "fake_checkpoint.pth"
+        ckpt.touch()
+        return ckpt
+
+    result = run_baseline_pipeline(
+        scenes=[good_scene, broken_scene],
+        train_fn=fake_train_fn,
+        render_fn=_fake_render_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        output_root=tmp_path,
+    )
+
+    # "chair" succeeded and has a score, but the overall submission must
+    # still be withheld because "broken" was skipped — one good scene does
+    # not entitle the pipeline to ship a partial zip.
+    assert "chair" in result.per_scene_scores
+    assert "broken" in result.skipped_scenes
+    assert result.submission_zip is None
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1676,7 +2732,6 @@ Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.orchestrator'`.
 ```python
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1685,23 +2740,25 @@ from PIL import Image
 
 from src.common.colmap_io import load_sparse_scene
 from src.common.config import SceneConfig
-from src.evaluation.compute_metrics import combine_score, compute_pair_metrics, load_lpips_model
+from src.common.pose_utils import camera_extrinsics_from_colmap, focal2fov, qvec2rotmat
+from src.data_validation.validate_scene import validate_scene
+from src.evaluation.compute_metrics import combine_score, compute_pair_metrics
 from src.evaluation.make_holdout_split import select_holdout_images
-from src.rendering.render_from_csv import CameraParams
+from src.rendering.render_from_csv import CameraParams, load_test_poses_csv
 from src.submission.package_submission import package_submission
 from src.submission.validate_submission import validate_submission
+from src.training.holdout_scene import build_filtered_scene
 
 
 @dataclass
 class PipelineResult:
     per_scene_scores: dict[str, float] = field(default_factory=dict)
+    skipped_scenes: dict[str, list[str]] = field(default_factory=dict)
     validation_problems: list[str] = field(default_factory=list)
     submission_zip: Path | None = None
 
 
 def _camera_params_for_holdout(sparse, holdout_names, image_dims) -> list[CameraParams]:
-    from src.common.pose_utils import camera_extrinsics_from_colmap, focal2fov
-
     width, height = image_dims
     params = []
     id_to_camera = sparse.cameras
@@ -1720,23 +2777,73 @@ def _camera_params_for_holdout(sparse, holdout_names, image_dims) -> list[Camera
 
 
 def run_baseline_pipeline(
-    scenes: list[SceneConfig], train_fn, render_fn, psnr_max: float, output_root: Path,
+    scenes: list[SceneConfig], train_fn, render_fn, lpips_model, psnr_max: float,
+    output_root: Path,
 ) -> PipelineResult:
+    """Two training runs per scene:
+
+    1. Eval training: on a build_filtered_scene copy with holdout images
+       physically excluded (Task 8b) -> eval_checkpoint. Used only to score
+       holdout images the model never trained on (no leakage).
+    2. Final training: on a build_filtered_scene copy with an EMPTY holdout
+       set -> final_checkpoint. This still goes through Task 8b, not the
+       raw `scene` — see the note below on why the raw scene is never a
+       valid training input for this dataset.
+
+    `lpips_model` is always injected by the caller (real callers pass
+    `load_lpips_model()` from Task 6; tests pass a network-free stub) so
+    this function never implicitly requires network access.
+
+    Each scene is validated (Task 5) before any GPU work — an invalid
+    scene is recorded in `result.skipped_scenes` and both training phases
+    are skipped for it entirely, so a broken scene never wastes Colab time.
+
+    IMPORTANT — never pass the raw `scene` object to `train_fn` directly.
+    `images.bin` always registers more cameras than are distributed as
+    files (verified against the real dataset — see Task 4/5/8b), and the
+    vendored loader crashes on `Image.open()` for any registered image
+    with no file. `build_filtered_scene` is what makes a scene safe to
+    train on; Phase A gets this "for free" via the holdout filter, so
+    Phase B must call it too, with `holdout_names=set()`, purely to strip
+    the registered-without-file images before training on 100% of the
+    real, distributed training data.
+    """
     output_root = Path(output_root)
     result = PipelineResult()
-    lpips_model = load_lpips_model()
     scene_render_dirs = {}
 
     for scene in scenes:
         scene_output = output_root / scene.name
-        checkpoint = train_fn(scene, scene_output / "baseline")
+        submission_dir = scene.effective_submission_dir
+
+        report = validate_scene(scene)
+        if report.problems:
+            result.skipped_scenes[scene.name] = report.problems
+            continue
 
         sparse = load_sparse_scene(scene.sparse_dir)
+        file_backed_names = {p.name for p in scene.train_images_dir.iterdir() if p.is_file()}
+        # Holdout candidates are drawn ONLY from images that actually have
+        # a file: a registered-without-file image (e.g. a test_poses.csv
+        # image) has no local pixel data to score against even if chosen,
+        # and build_filtered_scene would exclude it anyway regardless of
+        # whether it's "selected" as holdout.
         camera_centers = {
-            img.name: -np.transpose(_qvec_rotmat(img.qvec)) @ np.array(img.tvec)
+            img.name: -np.transpose(qvec2rotmat(np.array(img.qvec))) @ np.array(img.tvec)
             for img in sparse.images.values()
+            if img.name in file_backed_names
         }
         holdout_names = set(select_holdout_images(camera_centers, holdout_ratio=0.125))
+
+        # Phase A: leak-free eval training on a scene copy with holdout
+        # images physically removed from both images.bin and the images
+        # folder (Task 8b) — the model literally cannot have seen them.
+        # build_filtered_scene also strips registered-without-file images
+        # automatically (see its docstring), so this is training-safe.
+        filtered_scene = build_filtered_scene(
+            scene, holdout_names, scene_output / "filtered_scene",
+        )
+        eval_checkpoint = train_fn(filtered_scene, scene_output / "eval_train")
 
         sample_image = next(scene.train_images_dir.iterdir())
         with Image.open(sample_image) as im:
@@ -1744,7 +2851,7 @@ def run_baseline_pipeline(
 
         holdout_params = _camera_params_for_holdout(sparse, holdout_names, image_dims)
         holdout_render_dir = scene_output / "holdout_render"
-        rendered_paths = render_fn(checkpoint, holdout_params, holdout_render_dir)
+        rendered_paths = render_fn(eval_checkpoint, holdout_params, holdout_render_dir)
 
         scores = []
         for path, params in zip(rendered_paths, holdout_params):
@@ -1757,24 +2864,36 @@ def run_baseline_pipeline(
             ))
         result.per_scene_scores[scene.name] = float(np.mean(scores)) if scores else 0.0
 
-        test_params = load_sparse_scene  # placeholder avoided below
-        from src.rendering.render_from_csv import load_test_poses_csv
+        # Phase B: final training on 100% of the real distributed training
+        # data — still goes through build_filtered_scene (empty holdout)
+        # to strip registered-without-file images; this is the checkpoint
+        # that actually gets shipped in the submission.
+        full_training_scene = build_filtered_scene(
+            scene, set(), scene_output / "full_scene",
+        )
+        final_checkpoint = train_fn(full_training_scene, scene_output / "final_train")
         test_render_dir = scene_output / "test_render"
         test_params_list = load_test_poses_csv(scene.test_poses_csv)
-        render_fn(checkpoint, test_params_list, test_render_dir)
-        scene_render_dirs[scene.name] = test_render_dir
+        render_fn(final_checkpoint, test_params_list, test_render_dir)
+        scene_render_dirs[submission_dir] = test_render_dir
+
+    if result.skipped_scenes:
+        # Fail closed: the exam voids the ENTIRE score for a missing scene
+        # (spec section 14 / debai.md 1.6-8.4), so a submission.zip that's
+        # already known to be short a scene is worse than no zip at all —
+        # never package or validate one while any scene was skipped.
+        result.validation_problems = [
+            f"scene '{name}' skipped, no submission produced: {problems}"
+            for name, problems in result.skipped_scenes.items()
+        ]
+        result.submission_zip = None
+        return result
 
     submission_zip = output_root / "submission.zip"
     package_submission(scene_render_dirs, submission_zip)
     result.validation_problems = validate_submission(submission_zip, scenes)
     result.submission_zip = submission_zip
     return result
-
-
-def _qvec_rotmat(qvec):
-    from src.common.pose_utils import qvec2rotmat
-    import numpy as np
-    return qvec2rotmat(np.array(qvec))
 ```
 
 Create `src/orchestrator/__init__.py` (empty).
@@ -1785,10 +2904,8 @@ Create `src/orchestrator/__init__.py` (empty).
 pytest tests/test_run_pipeline.py -v
 ```
 
-Expected: `PASS` (1 passed). If it fails on the LPIPS network download (no network access in
-the test sandbox), mark the test `@pytest.mark.network` and skip it in offline environments;
-document this clearly in the test file's docstring rather than silently weakening the
-assertion.
+Expected: `PASS` (2 passed). Both tests use `_StubLpipsModel` and never call
+`load_lpips_model()`, so — unlike Task 6 Step 6 — this requires no network access at all.
 
 - [ ] **Step 5: Commit**
 
@@ -1884,20 +3001,94 @@ git commit -m "Add Colab environment setup script with CUDA extension caching"
 ## Self-Review Summary
 
 - **Spec coverage:** Task 1 covers spec section 3/4 (repo scaffold, environment). Task 2
-  covers section 3 (`configs/scenes.yaml`). Tasks 3-4 cover the pose-math correctness risk
-  called out in spec sections 8/12. Task 5 covers section 5. Task 6 covers section 10's metric
-  formula. Task 7 covers section 10's holdout methodology. Task 8 covers section 4 (train
-  wrapper, resume-safe per section 4). Task 9 covers section 8. Tasks 10-11 cover sections 14
-  and the completeness risk in section 8.4/14. Task 12 covers section 11 (orchestrator),
-  baseline-only. Task 13 covers section 4 (Colab setup, CUDA caching). Spec sections 6, 7, 9,
-  13, 15 (experiment matrix, VRAM guard, auto-select-best-config, visual QA, reproducibility
-  bundle) are explicitly deferred to the follow-up "advanced techniques" plan, as stated in
-  Global Constraints.
+  covers section 3 (`configs/scenes.yaml`, now including the `submission_dir` mapping). Tasks
+  3-4 cover the pose-math correctness risk called out in spec sections 8/12. Task 5 covers
+  section 5 (data validation, now including camera-model/numeric/duplicate checks). Task 6
+  covers section 10's metric formula. Task 7 covers section 10's holdout methodology. Task 8
+  covers section 4 (train wrapper, absolute paths, no baseline `--eval`). Task 8b covers the
+  actual leak-free enforcement of Task 7's holdout selection (previously only selected, never
+  enforced). Task 9 covers section 8 (exact filename/extension preservation, not renamed to
+  `.png`). Tasks 10-11 cover section 14 and the completeness risk in section 8.4/14, keyed by
+  `effective_submission_dir`. Task 12 covers section 11 (orchestrator), baseline-only, now with
+  two training phases (leak-free eval vs. full-data final). Task 13 covers section 4 (Colab
+  setup, CUDA caching). Spec sections 6, 7, 9, 13, 15 (experiment matrix, VRAM guard,
+  auto-select-best-config, visual QA, reproducibility bundle) are explicitly deferred to the
+  follow-up "advanced techniques" plan, as stated in Global Constraints.
 - **Placeholder scan:** no TBD/TODO remain; Task 13 Step 2 item 5 documents a genuine
   empirical unknown (whether `pip download --no-binary` round-trips these two submodules)
   rather than hiding it — this is flagged as a manual verification item, not left as an
-  unimplemented stub.
-- **Type consistency:** `SceneConfig` (Task 2) fields are used identically across Tasks 5, 8,
-  9, 11, 12. `CameraParams` (Task 3) fields (`image_name, R, T, fov_x, fov_y, width, height`)
-  are used identically in Tasks 9 and 12. `combine_score`/`compute_pair_metrics` signatures
-  from Task 6 match their usage in Task 12.
+  unimplemented stub. Task 8b's struct format is similarly flagged as verify-by-round-trip
+  rather than assumed correct against an unseen exact spec.
+- **Type consistency:** `SceneConfig` (Task 2, now with `submission_dir`/`effective_submission_dir`)
+  fields are used identically across Tasks 5, 8, 8b, 9, 11, 12. `CameraParams` (Task 3) fields
+  (`image_name, R, T, fov_x, fov_y, width, height`) are used identically in Tasks 9 and 12.
+  `combine_score`/`compute_pair_metrics` signatures from Task 6 match their usage in Task 12.
+  `build_filtered_scene`'s return type (Task 8b) is a `SceneConfig`, matching what `train_fn`
+  (injected in Task 12) expects as its first argument — same as the original, unfiltered scene.
+- **Fixes applied after external review (this revision):** (1) submission folder naming is now
+  an explicit per-scene config value instead of an unstated assumption baked into code (Task 2,
+  10, 11, 12). (2) rendered/validated/packaged output filenames now preserve the CSV's exact
+  `image_name` and extension instead of being silently rewritten to `.png` (Task 9, 11, 12).
+  (3) holdout images selected by Task 7 are now physically excluded from training via a new
+  Task 8b before any eval metric is computed, closing a data-leakage hole where the reported
+  holdout score would have been measured on images the model had already trained on. (4)
+  `build_train_argv` now resolves `scene.root`/`output_dir`/`resume_checkpoint` to absolute
+  paths, since the documented manual Colab invocation changes `cwd` to
+  `third_party/gaussian-splatting` (Task 8). (5) `validate_scene` now checks camera model
+  support, numeric column validity, duplicate `image_name`, and non-positive width/height
+  (Task 5).
+- **Fixes applied after a second external review (this revision):** (6) added
+  `SceneConfig.gs_source_dir`, always derived from `train_images_dir.parent` — `scene.root`
+  itself was never a valid `--source_path` for the real dataset (which nests `images/`/`sparse/
+  0/` one level deeper, under `train/`, than the baseline's expected direct-children layout);
+  `build_train_argv` now uses `gs_source_dir` (Task 2, Task 8). This was Critical: training
+  would have failed immediately on Colab against every real scene. (7) `validate_submission`
+  now also flags unexpected/extra entries (extra images within a scene, an entire extra
+  top-level scene directory, junk like `__MACOSX/`) — it previously only checked for missing
+  files and wrong sizes, but the exam voids the score for extra scenes/files too, not just
+  missing ones (Task 11). (8) the spec (`docs/superpowers/specs/2026-07-18-nvs-bts-pipeline-
+  design.md` section 14) still described the old `scene_XXX/0001.png` assumption after the
+  plan had already moved to `<submission_dir>/<image_name>` — updated to match and to carry the
+  same "confirm with organizers" caveat. (9) `run_baseline_pipeline` now calls `validate_scene`
+  before either training phase and records failures in `PipelineResult.skipped_scenes` instead
+  of training blind — the Interfaces text already claimed this dependency but the code never
+  called it. (10) `lpips_model` is now an explicit parameter of `run_baseline_pipeline` instead
+  of being loaded internally via `load_lpips_model()`, which downloaded real AlexNet weights
+  inside what was supposed to be a network-free local test. (11) `render_all` now passes
+  `quality=100, subsampling=0` when saving to a `.jpg`/`.jpeg` path, since PIL's default
+  quality=75 would needlessly re-compress an already-final rendered image before every metric
+  is computed on it.
+- **Fixes applied after a third external review (this revision):** (12) `run_baseline_pipeline`
+  now **fails closed** on skipped scenes — if any scene lands in `skipped_scenes`, the pipeline
+  does NOT package a partial `submission.zip` (sets `submission_zip = None` and reports the
+  skipped scenes in `validation_problems`). Previously it packaged and validated a zip even
+  though a scene was missing, which is worse than producing nothing given that the exam voids the
+  entire score for a missing scene (spec section 14 / debai.md 1.6-8.4). Two new tests cover
+  this: a single skipped scene withholds the zip, and a mix of one good + one broken scene still
+  withholds it (one success does not entitle a partial submission).
+- **Critical discovery from actually querying the real data (this revision), fixed across
+  Tasks 4, 5, 8b, 12:** `images.bin` registers MORE cameras than there are files in
+  `train_images_dir`, for every scene in the dataset — verified directly: chair has 263
+  registered / 205 files (58 missing = exactly `test_poses.csv`'s image names), bonsai 276/248
+  (28 missing = exactly its test set), HCM0421 350/240 and HCM0539 398/240 (110/158 missing,
+  test_poses.csv names a strict subset — the rest are extra calibration-only frames). This is
+  intentional dataset design (SfM run over more images than are distributed as training pixels),
+  not corruption. It was invisible until Task 4 actually loaded real `images.bin` data instead
+  of assuming file count == registered count. It matters because the vendored
+  `utils/camera_utils.py::loadCam` does `Image.open(cam_info.image_path)` with **no error
+  handling**, and `readColmapSceneInfo` treats every registered camera as a training camera
+  whenever `dataset.eval=False` (which every training call in this plan uses, since holdout is
+  handled by Task 8b instead of the baseline's own `--eval`) — so training on an unfiltered
+  scene would have crashed with `FileNotFoundError` on the first sampled phantom camera, for
+  every scene, every time. Fixed by: (a) Task 4's test now asserts the real registered count
+  (263 for chair) instead of the file count, with an explicit second test documenting the gap;
+  (b) Task 5's `validate_scene` no longer treats registered-without-file as a `problems` entry
+  (renamed `missing_images` → `registered_without_file`, informational only) but DOES now flag
+  the opposite direction (a file with no COLMAP registration) and the case of a `test_poses.csv`
+  name with no registration anywhere; (c) Task 8b's `build_filtered_scene` now ALWAYS excludes
+  registered-without-file images in addition to whatever `holdout_names` the caller passes, so
+  `build_filtered_scene(scene, set(), ...)` is the correct way to get a "full data" scene that
+  is still safe to train on; (d) Task 12's orchestrator now restricts holdout-candidate camera
+  centers to file-backed images only, and Phase B ("final training") now goes through
+  `build_filtered_scene(scene, set(), ...)` instead of passing the raw `scene` straight to
+  `train_fn` — the raw scene is never a valid training input for this dataset.

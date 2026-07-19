@@ -193,11 +193,17 @@ deadline.
 
 ## 14. Submission packaging & validation
 
-- `package_submission.py`: gom ảnh render theo cấu trúc `scene_XXX/0001.png...` đúng yêu cầu
-  mục 7 của đề bài.
+- `package_submission.py`: gom ảnh render theo cấu trúc `<submission_dir>/<image_name>` (đúng
+  tên file và extension gốc từ `test_poses.csv`, không đổi thành `.png`) đúng yêu cầu mục 7 của
+  đề bài. `<submission_dir>` là giá trị config theo từng scene (mặc định bằng tên scene thật,
+  vd `HCM0421`, `chair`) - ví dụ `scene_001/0001.png` trong đề bài chỉ là minh hoạ cấu trúc,
+  **cần xác nhận lại với BTC** xem có bắt buộc đặt tên `scene_001` kiểu số thứ tự hay không,
+  vì không thể suy ra chắc chắn từ dữ liệu được cấp.
 - `validate_submission.py`: bắt buộc chạy trước khi nộp - kiểm tra đủ số scene, đúng tên file
-  theo `image_name` trong `test_poses.csv`, đúng `width x height` từng ảnh. Thiếu 1 scene sẽ
-  làm mất điểm toàn bộ theo quy định mục 8.4, đây là rủi ro vận hành cần phòng tuyệt đối.
+  theo `image_name` trong `test_poses.csv`, đúng `width x height` từng ảnh, và **không có file
+  hoặc scene thừa** (kể cả rác như `__MACOSX/`) so với danh sách mong đợi. Thiếu hoặc thừa 1
+  scene/file sẽ làm mất điểm toàn bộ theo quy định mục 8.4, đây là rủi ro vận hành cần phòng
+  tuyệt đối.
 
 ## 15. Reproducibility bundle
 
