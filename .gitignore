@@ -19,3 +19,9 @@ venv/
 
 # OS
 .DS_Store
+
+# Claude Code local settings (per-machine permission overrides, not shared)
+.claude/settings.local.json
+
+# Superpowers SDD scratch (task briefs, reports, review packages)
+.superpowers/
