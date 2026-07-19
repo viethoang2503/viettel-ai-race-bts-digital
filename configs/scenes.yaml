@@ -1,0 +1,16 @@
+dataset_root: VAI_NVS_DATA_ROUND2
+scenes:
+  - name: HCM0421
+    submission_dir: HCM0421
+  - name: HCM0539
+    submission_dir: HCM0539
+  - name: HCM0540
+    submission_dir: HCM0540
+  - name: HCM0644
+    submission_dir: HCM0644
+  - name: HCM0674
+    submission_dir: HCM0674
+  - name: chair
+    submission_dir: chair
+  - name: bonsai
+    submission_dir: bonsai
