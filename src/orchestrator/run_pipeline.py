@@ -16,6 +16,7 @@ from src.rendering.render_from_csv import CameraParams, load_test_poses_csv
 from src.submission.package_submission import package_submission
 from src.submission.validate_submission import validate_submission
 from src.training.holdout_scene import build_filtered_scene
+from src.training.undistort_scene import undistort_scene
 
 
 @dataclass
@@ -89,8 +90,17 @@ def run_baseline_pipeline(
             result.skipped_scenes[scene.name] = report.problems
             continue
 
-        sparse = load_sparse_scene(scene.sparse_dir)
-        file_backed_names = {p.name for p in scene.train_images_dir.iterdir() if p.is_file()}
+        # Real BTS scenes are SIMPLE_RADIAL (radially distorted); the
+        # vendored 3DGS only handles PINHOLE/SIMPLE_PINHOLE.
+        # undistort_scene is a no-op passthrough for scenes already using a
+        # supported model (chair, bonsai) and produces a PINHOLE copy
+        # otherwise. Every downstream step in this loop operates on
+        # working_scene, never the raw scene, except test_poses_csv /
+        # effective_submission_dir — undistortion never touches test poses.
+        working_scene = undistort_scene(scene, scene_output / "undistorted")
+
+        sparse = load_sparse_scene(working_scene.sparse_dir)
+        file_backed_names = {p.name for p in working_scene.train_images_dir.iterdir() if p.is_file()}
         # Holdout candidates are drawn ONLY from images that actually have
         # a file: a registered-without-file image (e.g. a test_poses.csv
         # image) has no local pixel data to score against even if chosen,
@@ -109,11 +119,11 @@ def run_baseline_pipeline(
         # build_filtered_scene also strips registered-without-file images
         # automatically (see its docstring), so this is training-safe.
         filtered_scene = build_filtered_scene(
-            scene, holdout_names, scene_output / "filtered_scene",
+            working_scene, holdout_names, scene_output / "filtered_scene",
         )
         eval_checkpoint = train_fn(filtered_scene, scene_output / "eval_train")
 
-        sample_image = next(scene.train_images_dir.iterdir())
+        sample_image = next(working_scene.train_images_dir.iterdir())
         with Image.open(sample_image) as im:
             image_dims = im.size  # (width, height)
 
@@ -123,7 +133,7 @@ def run_baseline_pipeline(
 
         scores = []
         for path, params in zip(rendered_paths, holdout_params):
-            gt_path = scene.train_images_dir / params.image_name
+            gt_path = working_scene.train_images_dir / params.image_name
             pred = np.array(Image.open(path).convert("RGB"))
             gt = np.array(Image.open(gt_path).convert("RGB").resize(pred.shape[1::-1]))
             metrics = compute_pair_metrics(pred, gt, lpips_model)
@@ -137,7 +147,7 @@ def run_baseline_pipeline(
         # to strip registered-without-file images; this is the checkpoint
         # that actually gets shipped in the submission.
         full_training_scene = build_filtered_scene(
-            scene, set(), scene_output / "full_scene",
+            working_scene, set(), scene_output / "full_scene",
         )
         final_checkpoint = train_fn(full_training_scene, scene_output / "final_train")
         test_render_dir = scene_output / "test_render"

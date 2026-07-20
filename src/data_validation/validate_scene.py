@@ -13,7 +13,12 @@ REQUIRED_CSV_COLUMNS = {
 NUMERIC_CSV_COLUMNS = {
     "qw", "qx", "qy", "qz", "tx", "ty", "tz", "fx", "fy", "cx", "cy", "width", "height",
 }
-SUPPORTED_CAMERA_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
+# SIMPLE_RADIAL is "supported" because run_baseline_pipeline always routes
+# scenes through undistort_scene before training, converting SIMPLE_RADIAL
+# to PINHOLE — see src/training/undistort_scene.py. This module never
+# undistorts anything itself; it only decides whether the model is one
+# undistort_scene knows how to handle.
+SUPPORTED_CAMERA_MODELS = {"PINHOLE", "SIMPLE_PINHOLE", "SIMPLE_RADIAL"}
 
 
 @dataclass

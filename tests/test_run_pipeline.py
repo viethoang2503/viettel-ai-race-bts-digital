@@ -241,3 +241,104 @@ def test_run_baseline_pipeline_computes_matching_fov_for_simple_pinhole_scene(tm
     for params in captured_holdout_params:
         assert params.fov_x == pytest.approx(expected_fov_x, rel=1e-6)
         assert params.fov_y == pytest.approx(expected_fov_y, rel=1e-6)
+
+
+class _FakeImageForRadial:
+    def __init__(self, name, camera_id, qvec, tvec):
+        self.qvec = qvec
+        self.tvec = tvec
+        self.camera_id = camera_id
+        self.name = name
+
+
+def _make_simple_radial_scene(tmp_path):
+    import struct
+
+    from src.training.colmap_writer import write_images_binary
+
+    root = tmp_path / "hcm_like_scene"
+    images_dir = root / "train" / "images"
+    sparse_dir = root / "train" / "sparse" / "0"
+    images_dir.mkdir(parents=True)
+    sparse_dir.mkdir(parents=True)
+
+    with open(sparse_dir / "cameras.bin", "wb") as fid:
+        fid.write(struct.pack("<Q", 1))
+        fid.write(struct.pack("<iiQQ", 1, 2, 64, 48))  # model_id 2 = SIMPLE_RADIAL
+        fid.write(struct.pack("<dddd", 80.0, 32.0, 24.0, 0.02))
+
+    images = {
+        i: _FakeImageForRadial(
+            f"{i:04d}.jpg", 1,
+            qvec=np.array([1.0, 0.0, 0.0, 0.0]),
+            tvec=np.array([float(i) * 0.1, 0.0, 0.0]),
+        )
+        for i in range(1, 9)  # 8 images so holdout_ratio=0.125 selects exactly 1
+    }
+
+    from PIL import Image as PILImage
+    for name in images.values():
+        PILImage.new("RGB", (64, 48), color=(10, 20, 30)).save(images_dir / name.name)
+
+    # Real scenes register test_poses.csv image names in images.bin with no
+    # corresponding file (verified against VAI_NVS_DATA_ROUND2 — see Task 4/5
+    # of the core plan) — match that here, AFTER writing the 8 real training
+    # image files above, so validate_scene doesn't flag the test pose as
+    # unregistered (an unrelated fixture gap) while also not accidentally
+    # writing a file for it (which would defeat the "registered without
+    # file" case this is meant to reproduce).
+    images[9] = _FakeImageForRadial(
+        "test_0001.jpg", 1,
+        qvec=np.array([1.0, 0.0, 0.0, 0.0]), tvec=np.array([0.0, 0.0, 0.0]),
+    )
+    write_images_binary(images, sparse_dir / "images.bin")
+    with open(sparse_dir / "points3D.bin", "wb") as fid:
+        fid.write(struct.pack("<Q", 0))
+
+    test_poses_dir = root / "test"
+    test_poses_dir.mkdir()
+    csv_path = test_poses_dir / "test_poses.csv"
+    with open(csv_path, "w", newline="") as f:
+        import csv
+        writer = csv.DictWriter(f, fieldnames=[
+            "image_name", "qw", "qx", "qy", "qz", "tx", "ty", "tz",
+            "fx", "fy", "cx", "cy", "width", "height",
+        ])
+        writer.writeheader()
+        writer.writerow({
+            "image_name": "test_0001.jpg", "qw": 1, "qx": 0, "qy": 0, "qz": 0,
+            "tx": 0, "ty": 0, "tz": 0, "fx": 80, "fy": 80, "cx": 32, "cy": 24,
+            "width": 64, "height": 48,
+        })
+
+    return SceneConfig(
+        name="hcm_like_scene", root=root, train_images_dir=images_dir,
+        sparse_dir=sparse_dir, test_poses_csv=csv_path, submission_dir="hcm_like_scene",
+    )
+
+
+def test_run_baseline_pipeline_trains_simple_radial_scene_via_undistortion(tmp_path):
+    scene = _make_simple_radial_scene(tmp_path)
+
+    def fake_train_fn(scene_arg, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = output_dir / "fake_checkpoint.pth"
+        ckpt.touch()
+        return ckpt
+
+    result = run_baseline_pipeline(
+        scenes=[scene],
+        train_fn=fake_train_fn,
+        render_fn=_fake_render_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        output_root=tmp_path,
+    )
+
+    # Before this fix, validate_scene would flag SIMPLE_RADIAL as
+    # unsupported and this scene would land in skipped_scenes, withholding
+    # the whole submission.
+    assert result.skipped_scenes == {}
+    assert "hcm_like_scene" in result.per_scene_scores
+    assert result.submission_zip is not None
