@@ -60,6 +60,54 @@ def test_validate_scene_detects_missing_folder_gracefully(tmp_path):
     assert any("sparse" in p.lower() or "not found" in p.lower() for p in report.problems)
 
 
+def test_validate_scene_reports_problem_for_corrupt_sparse_binary(tmp_path):
+    from src.common.config import SceneConfig
+
+    root = tmp_path / "broken_scene"
+    images_dir = root / "train" / "images"
+    sparse_dir = root / "train" / "sparse" / "0"
+    images_dir.mkdir(parents=True)
+    sparse_dir.mkdir(parents=True)
+
+    # cameras.bin exists but is truncated garbage — not a valid COLMAP file.
+    (sparse_dir / "cameras.bin").write_bytes(b"\x01\x02\x03")
+    (sparse_dir / "images.bin").write_bytes(b"")
+    (sparse_dir / "points3D.bin").write_bytes(b"")
+
+    scene = SceneConfig(
+        name="broken_scene", root=root, train_images_dir=images_dir,
+        sparse_dir=sparse_dir, test_poses_csv=root / "test" / "test_poses.csv",
+    )
+
+    report = validate_scene(scene)
+
+    assert report.problems != []
+    assert any("sparse" in p.lower() for p in report.problems)
+
+
+def test_validate_scene_reports_problem_for_missing_sparse_file(tmp_path):
+    from src.common.config import SceneConfig
+
+    root = tmp_path / "missing_camera_file"
+    images_dir = root / "train" / "images"
+    sparse_dir = root / "train" / "sparse" / "0"
+    images_dir.mkdir(parents=True)
+    sparse_dir.mkdir(parents=True)
+    # images.bin and points3D.bin present, cameras.bin missing entirely.
+    (sparse_dir / "images.bin").write_bytes(b"")
+    (sparse_dir / "points3D.bin").write_bytes(b"")
+
+    scene = SceneConfig(
+        name="missing_camera_file", root=root, train_images_dir=images_dir,
+        sparse_dir=sparse_dir, test_poses_csv=root / "test" / "test_poses.csv",
+    )
+
+    report = validate_scene(scene)
+
+    assert report.problems != []
+    assert any("cameras.bin" in p for p in report.problems)
+
+
 def _write_test_csv(path, rows):
     import csv as csv_module
     with open(path, "w", newline="") as f:

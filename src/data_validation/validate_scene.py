@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import struct
 from dataclasses import dataclass, field
 
 from src.common.colmap_io import load_sparse_scene
@@ -63,7 +64,16 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
         report.problems.append(f"train images dir not found: {scene.train_images_dir}")
         return report
 
-    sparse = load_sparse_scene(scene.sparse_dir)
+    for required_file in ("cameras.bin", "images.bin", "points3D.bin"):
+        if not (scene.sparse_dir / required_file).exists():
+            report.problems.append(f"missing required sparse file: {required_file}")
+            return report
+
+    try:
+        sparse = load_sparse_scene(scene.sparse_dir)
+    except (OSError, struct.error, ValueError) as e:
+        report.problems.append(f"failed to parse sparse reconstruction: {e}")
+        return report
     registered_names = {img.name for img in sparse.images.values()}
     folder_names = {p.name for p in scene.train_images_dir.iterdir() if p.is_file()}
 
