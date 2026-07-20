@@ -39,7 +39,7 @@ def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path,
 
     assert len(calls) == 1
     argv, cwd, check = calls[0]
-    assert cwd == "third_party/gaussian-splatting"
+    assert cwd == str(gs_train_fn.GS_ROOT)
     assert check is True
     assert "--start_checkpoint" not in argv
     assert "--checkpoint_iterations" in argv

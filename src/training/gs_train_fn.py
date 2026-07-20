@@ -6,6 +6,8 @@ from pathlib import Path
 from src.common.config import SceneConfig
 from src.training.train_wrapper import build_train_argv, checkpoint_iteration, find_latest_checkpoint
 
+GS_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "gaussian-splatting"
+
 
 def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000) -> Path:
     """Resume-safe wrapper around the vendored train.py, invoked via
@@ -28,7 +30,7 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
         resume_checkpoint=existing,
         extra_args=["--checkpoint_iterations", str(iterations)],
     )
-    subprocess.run(argv, cwd="third_party/gaussian-splatting", check=True)
+    subprocess.run(argv, cwd=str(GS_ROOT), check=True)
 
     checkpoint = find_latest_checkpoint(output_dir)
     if checkpoint is None or (checkpoint_iteration(checkpoint) or 0) < iterations:

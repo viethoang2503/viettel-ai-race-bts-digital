@@ -56,6 +56,8 @@ def test_build_train_argv_without_resume():
     assert "--iterations" in argv
     assert "30000" in argv
     assert "--start_checkpoint" not in argv
+    import sys
+    assert argv[0] == sys.executable
 
 
 def test_build_train_argv_with_resume_checkpoint():

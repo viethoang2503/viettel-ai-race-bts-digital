@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 from src.common.config import SceneConfig
@@ -51,7 +52,7 @@ def build_train_argv(
     Task 2).
     """
     argv = [
-        "python", "train.py",
+        sys.executable, "train.py",
         "--source_path", str(Path(scene.gs_source_dir).resolve()),
         "--model_path", str(Path(output_dir).resolve()),
         "--iterations", str(iterations),
