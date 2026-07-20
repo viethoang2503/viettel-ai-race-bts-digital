@@ -205,6 +205,47 @@ def test_validate_submission_flags_unreadable_image_instead_of_crashing(tmp_path
     assert any("0001.png" in p and "not a valid image" in p.lower() for p in problems)
 
 
+def test_validate_submission_flags_truncated_image_data(tmp_path):
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png", width=64, height=32)])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    full_png = _make_png_bytes(64, 32)
+    truncated = full_png[: len(full_png) // 2]  # header intact, pixel data cut
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/0001.png", truncated)
+
+    problems = validate_submission(zip_path, [scene])
+    assert any("0001.png" in p and "not a valid image" in p.lower() for p in problems)
+
+
+def test_validate_submission_flags_non_rgb_image(tmp_path):
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    csv_path = tmp_path / "scene_a_test_poses.csv"
+    _write_csv(csv_path, [_make_row("0001.png", width=64, height=32)])
+    scene = SceneConfig(
+        name="scene_a", root=tmp_path, train_images_dir=tmp_path,
+        sparse_dir=tmp_path, test_poses_csv=csv_path,
+    )
+
+    buf = BytesIO()
+    PILImage.new("L", (64, 32)).save(buf, format="PNG")  # grayscale, correct size
+
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("scene_a/0001.png", buf.getvalue())
+
+    problems = validate_submission(zip_path, [scene])
+    assert any("0001.png" in p and "mode" in p.lower() for p in problems)
+
+
 def test_validate_submission_flags_duplicate_zip_entries(tmp_path):
     csv_path = tmp_path / "scene_a_test_poses.csv"
     _write_csv(csv_path, [_make_row("0001.png")])

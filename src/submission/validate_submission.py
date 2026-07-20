@@ -52,10 +52,16 @@ def validate_submission(zip_path: Path, scenes: list[SceneConfig]) -> list[str]:
                 data = zf.read(arcname)
                 try:
                     with Image.open(BytesIO(data)) as img:
+                        img.load()  # force full decode, not just the header
                         if img.size != (params.width, params.height):
                             problems.append(
                                 f"scene '{submission_dir}': {params.image_name} has wrong size "
                                 f"{img.size}, expected {(params.width, params.height)}"
+                            )
+                        if img.mode != "RGB":
+                            problems.append(
+                                f"scene '{submission_dir}': {params.image_name} has mode "
+                                f"'{img.mode}', expected 'RGB'"
                             )
                 except (UnidentifiedImageError, OSError) as e:
                     problems.append(
