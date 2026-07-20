@@ -45,7 +45,16 @@ def build_filtered_scene(
         src = (scene.train_images_dir / img.name).resolve()
         dst = images_out / img.name
         if not dst.exists():
-            os.symlink(src, dst)
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                # Google Drive's FUSE mount (the common case for
+                # scene.train_images_dir / output_dir on Colab) doesn't
+                # support symlinks at all — os.symlink raises
+                # OSError(errno 95, "Operation not supported") there.
+                # Fall back to a real copy, which works on every
+                # filesystem; local runs still get the cheap symlink.
+                shutil.copy2(src, dst)
 
     write_images_binary(kept_images, sparse_out / "images.bin")
     shutil.copy2(scene.sparse_dir / "cameras.bin", sparse_out / "cameras.bin")

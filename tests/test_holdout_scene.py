@@ -76,6 +76,34 @@ def test_build_filtered_scene_excludes_holdout_images_from_bin_and_folder(tmp_pa
         np.testing.assert_allclose(orig_by_name[name].tvec, filt_by_name[name].tvec, atol=1e-9)
 
 
+def test_build_filtered_scene_falls_back_to_copy_when_symlink_unsupported(tmp_path, monkeypatch):
+    # Reproduces the real Colab failure: Google Drive's FUSE mount doesn't
+    # support symlinks at all, so os.symlink raises
+    # OSError(errno 95, "Operation not supported") — build_filtered_scene
+    # must fall back to a real copy instead of crashing the whole pipeline.
+    import os as os_module
+
+    from src.training import holdout_scene
+
+    def _raise_unsupported(src, dst):
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(holdout_scene.os, "symlink", _raise_unsupported)
+
+    scene = _get_scene("chair")
+    sparse = load_sparse_scene(scene.sparse_dir)
+    file_backed = sorted(_file_backed_names(scene))
+    holdout = set(file_backed[:5])
+
+    filtered = build_filtered_scene(scene, holdout, tmp_path / "filtered_chair_no_symlink")
+
+    kept_name = (set(file_backed) - holdout).pop()
+    dst_path = filtered.train_images_dir / kept_name
+    assert dst_path.exists()
+    assert not dst_path.is_symlink(), "must be a real copy, not a (failed) symlink"
+    assert dst_path.read_bytes() == (scene.train_images_dir / kept_name).read_bytes()
+
+
 def test_build_filtered_scene_excludes_registered_without_file_even_with_empty_holdout(tmp_path):
     # This is the exact case Task 12's "final full training" phase relies
     # on: build_filtered_scene(scene, set(), ...) must still be safe to
