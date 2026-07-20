@@ -24,6 +24,21 @@ def focal2fov(focal: float, pixels: int) -> float:
     return 2 * math.atan(pixels / (2 * focal))
 
 
+def camera_focal_lengths(model: str, params) -> tuple[float, float]:
+    """COLMAP camera params -> (fx, fy), for the two models this pipeline
+    ever holds a camera in past undistortion (see undistort_scene.py):
+    SIMPLE_PINHOLE has one shared focal length (params = [f, cx, cy]);
+    PINHOLE has independent fx/fy (params = [fx, fy, cx, cy]). Verified
+    against real chair scene data: SIMPLE_PINHOLE params[1] is cx, NOT a
+    second focal length — using it as fy silently corrupts fov_y.
+    """
+    if model == "SIMPLE_PINHOLE":
+        return float(params[0]), float(params[0])
+    if model == "PINHOLE":
+        return float(params[0]), float(params[1])
+    raise ValueError(f"unsupported camera model for focal length extraction: {model}")
+
+
 def camera_extrinsics_from_colmap(
     qw: float, qx: float, qy: float, qz: float, tx: float, ty: float, tz: float,
 ) -> tuple[np.ndarray, np.ndarray]:

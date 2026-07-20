@@ -5,6 +5,7 @@ import pytest
 
 from src.common.pose_utils import (
     camera_extrinsics_from_colmap,
+    camera_focal_lengths,
     camera_params_from_csv_row,
     focal2fov,
     qvec2rotmat,
@@ -58,6 +59,23 @@ def test_camera_extrinsics_from_colmap_transposes_nontrivial_rotation():
     np.testing.assert_allclose(R, raw.T, atol=1e-10)
     assert not np.allclose(R, raw, atol=1e-10)
     np.testing.assert_allclose(T, np.array([1.0, 2.0, 3.0]), atol=1e-10)
+
+
+def test_camera_focal_lengths_simple_pinhole_shares_one_focal_length():
+    fx, fy = camera_focal_lengths("SIMPLE_PINHOLE", [1113.99, 360.0, 640.0])
+    assert fx == pytest.approx(1113.99)
+    assert fy == pytest.approx(1113.99)
+
+
+def test_camera_focal_lengths_pinhole_has_independent_fx_fy():
+    fx, fy = camera_focal_lengths("PINHOLE", [800.0, 850.0, 320.0, 240.0])
+    assert fx == pytest.approx(800.0)
+    assert fy == pytest.approx(850.0)
+
+
+def test_camera_focal_lengths_rejects_unsupported_model():
+    with pytest.raises(ValueError, match="RADIAL"):
+        camera_focal_lengths("SIMPLE_RADIAL", [800.0, 320.0, 240.0, 0.01])
 
 
 def test_camera_params_from_csv_row_computes_fov_and_keeps_metadata():

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from src.common.config import SceneConfig
@@ -200,3 +201,43 @@ def test_run_baseline_pipeline_withholds_zip_when_validation_finds_problems(tmp_
     # ...but the zip file itself must still exist on disk for debugging —
     # fail-closed means "don't expose it as valid", not "delete evidence".
     assert (tmp_path / "submission.zip").exists()
+
+
+def test_run_baseline_pipeline_computes_matching_fov_for_simple_pinhole_scene(tmp_path):
+    scene = _chair_scene()
+    captured_holdout_params = []
+
+    def fake_train_fn(scene_arg, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = output_dir / "fake_checkpoint.pth"
+        ckpt.touch()
+        return ckpt
+
+    def capturing_render_fn(checkpoint, params_list, output_dir):
+        if "holdout_render" in str(output_dir):
+            captured_holdout_params.extend(params_list)
+        return _fake_render_fn(checkpoint, params_list, output_dir)
+
+    run_baseline_pipeline(
+        scenes=[scene],
+        train_fn=fake_train_fn,
+        render_fn=capturing_render_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        output_root=tmp_path,
+    )
+
+    assert captured_holdout_params, "expected at least one holdout camera"
+    # chair's real COLMAP camera is SIMPLE_PINHOLE with params
+    # [f=1113.98975937, cx=360.0, cy=640.0] and image size 720x1280 (verified
+    # directly against VAI_NVS_DATA_ROUND2/chair). fov_x and fov_y need not
+    # be equal (the image isn't square), but both must derive from the same
+    # shared focal length f — before the fix, fov_y was derived from cx
+    # (360.0) instead, giving a very different, wrong value.
+    import math
+    expected_fov_x = 2 * math.atan(720 / (2 * 1113.98975937))
+    expected_fov_y = 2 * math.atan(1280 / (2 * 1113.98975937))
+    for params in captured_holdout_params:
+        assert params.fov_x == pytest.approx(expected_fov_x, rel=1e-6)
+        assert params.fov_y == pytest.approx(expected_fov_y, rel=1e-6)

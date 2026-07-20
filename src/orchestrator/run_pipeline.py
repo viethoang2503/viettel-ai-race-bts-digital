@@ -8,7 +8,7 @@ from PIL import Image
 
 from src.common.colmap_io import load_sparse_scene
 from src.common.config import SceneConfig
-from src.common.pose_utils import camera_extrinsics_from_colmap, focal2fov, qvec2rotmat
+from src.common.pose_utils import camera_extrinsics_from_colmap, camera_focal_lengths, focal2fov, qvec2rotmat
 from src.data_validation.validate_scene import validate_scene
 from src.evaluation.compute_metrics import combine_score, compute_pair_metrics
 from src.evaluation.make_holdout_split import select_holdout_images
@@ -34,7 +34,7 @@ def _camera_params_for_holdout(sparse, holdout_names, image_dims) -> list[Camera
         if img.name not in holdout_names:
             continue
         camera = id_to_camera[img.camera_id]
-        fx, fy = camera.params[0], camera.params[1]
+        fx, fy = camera_focal_lengths(camera.model, camera.params)
         r, t = camera_extrinsics_from_colmap(*img.qvec, *img.tvec)
         params.append(CameraParams(
             image_name=img.name, R=r, T=t,
