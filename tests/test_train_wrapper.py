@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from src.common.config import SceneConfig
-from src.training.train_wrapper import build_train_argv, find_latest_checkpoint
+from src.training.train_wrapper import build_train_argv, checkpoint_iteration, find_latest_checkpoint
 
 
 def test_find_latest_checkpoint_returns_none_when_empty(tmp_path):
@@ -14,6 +14,14 @@ def test_find_latest_checkpoint_picks_highest_iteration(tmp_path):
     (tmp_path / "chkpnt15000.pth").touch()
     result = find_latest_checkpoint(tmp_path)
     assert result == tmp_path / "chkpnt30000.pth"
+
+
+def test_checkpoint_iteration_parses_number():
+    assert checkpoint_iteration(Path("outputs/chair/chkpnt15000.pth")) == 15000
+
+
+def test_checkpoint_iteration_returns_none_for_non_matching_name():
+    assert checkpoint_iteration(Path("outputs/chair/model_final.pth")) is None
 
 
 def test_build_train_argv_without_resume():

@@ -23,6 +23,11 @@ def find_latest_checkpoint(output_dir: Path) -> Path | None:
     return candidates[-1][1]
 
 
+def checkpoint_iteration(path: Path) -> int | None:
+    match = _CHECKPOINT_RE.search(Path(path).name)
+    return int(match.group(1)) if match else None
+
+
 def build_train_argv(
     scene: SceneConfig,
     output_dir: Path,
