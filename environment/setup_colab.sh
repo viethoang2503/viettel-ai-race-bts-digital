@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRIVE_ROOT="/content/drive/MyDrive/var2026"
 CUDA_EXT_CACHE="$DRIVE_ROOT/cuda_ext_cache"
+DATASET_DRIVE_PATH="$DRIVE_ROOT/VAI_NVS_DATA_ROUND2"
 REPO_DIR="$(pwd)"
 
 echo "== Mounting Google Drive =="
@@ -12,6 +13,20 @@ drive.mount('/content/drive')
 "
 
 mkdir -p "$CUDA_EXT_CACHE"
+
+echo "== Linking dataset from Drive =="
+# configs/scenes.yaml's dataset_root ("VAI_NVS_DATA_ROUND2") is resolved
+# relative to the repo root at runtime, so the dataset must appear there —
+# but the dataset itself lives on Drive (too large for git), so it's
+# symlinked in rather than copied.
+if [ ! -e "VAI_NVS_DATA_ROUND2" ]; then
+  if [ -d "$DATASET_DRIVE_PATH" ]; then
+    ln -s "$DATASET_DRIVE_PATH" VAI_NVS_DATA_ROUND2
+  else
+    echo "WARNING: dataset not found at $DATASET_DRIVE_PATH" >&2
+    echo "  Upload the VAI_NVS_DATA_ROUND2/ folder to Drive at exactly that path before running the pipeline." >&2
+  fi
+fi
 
 echo "== Installing Python dependencies =="
 pip install -q -r environment/requirements.txt
