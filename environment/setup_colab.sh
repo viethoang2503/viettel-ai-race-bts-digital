@@ -6,11 +6,19 @@ CUDA_EXT_CACHE="$DRIVE_ROOT/cuda_ext_cache"
 DATASET_DRIVE_PATH="$DRIVE_ROOT/VAI_NVS_DATA_ROUND2"
 REPO_DIR="$(pwd)"
 
-echo "== Mounting Google Drive =="
-python3 -c "
-from google.colab import drive
-drive.mount('/content/drive')
-"
+# Drive must be mounted from an actual notebook cell BEFORE this script
+# runs, not from here: google.colab.drive.mount() talks to the browser
+# frontend through the notebook kernel's own process — calling it via
+# `python3 -c "..."` from a `!bash ...` shell command spawns a separate
+# subprocess that isn't the kernel, so it fails with
+# "AttributeError: 'NoneType' object has no attribute 'kernel'".
+if [ ! -d "/content/drive/MyDrive" ]; then
+  echo "ERROR: Google Drive is not mounted at /content/drive/MyDrive." >&2
+  echo "  Run this in its own notebook cell FIRST, then re-run this script:" >&2
+  echo "    from google.colab import drive" >&2
+  echo "    drive.mount('/content/drive')" >&2
+  exit 1
+fi
 
 mkdir -p "$CUDA_EXT_CACHE"
 
