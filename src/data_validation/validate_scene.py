@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import struct
 from dataclasses import dataclass, field
 
@@ -119,6 +120,9 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
             report.problems.append(f"duplicate image_name in test_poses.csv: {name}")
         seen_names.add(name)
 
+        if not name:
+            report.problems.append("test_poses.csv row has empty image_name")
+
         # The one direction where a name outside train/images/ IS a
         # problem: a test pose with no COLMAP registration at all has no
         # camera to have derived its pose from.
@@ -131,11 +135,18 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
         for col in NUMERIC_CSV_COLUMNS:
             raw = row.get(col)
             try:
-                numeric_values[col] = float(raw)
+                value = float(raw)
             except (TypeError, ValueError):
                 report.problems.append(
                     f"{name}: column '{col}' is not numeric (got {raw!r})"
                 )
+                continue
+            if not math.isfinite(value):
+                report.problems.append(
+                    f"{name}: column '{col}' is not finite (got {raw!r})"
+                )
+                continue
+            numeric_values[col] = value
 
         if "width" in numeric_values and numeric_values["width"] <= 0:
             report.problems.append(f"{name}: width must be positive, got {numeric_values['width']}")
@@ -144,5 +155,10 @@ def validate_scene(scene: SceneConfig) -> ValidationReport:
         for col in ("fx", "fy"):
             if col in numeric_values and numeric_values[col] <= 0:
                 report.problems.append(f"{name}: {col} must be positive, got {numeric_values[col]}")
+        for col in ("width", "height"):
+            if col in numeric_values and not numeric_values[col].is_integer():
+                report.problems.append(
+                    f"{name}: {col} must be a whole number, got {numeric_values[col]}"
+                )
 
     return report

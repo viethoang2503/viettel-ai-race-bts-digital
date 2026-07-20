@@ -168,6 +168,60 @@ def test_validate_scene_flags_non_numeric_and_non_positive_dims(tmp_path):
     assert any("zero.jpg" in p and ("width" in p.lower() or "height" in p.lower()) for p in report.problems)
 
 
+def test_validate_scene_flags_nan_and_inf_numeric_values(tmp_path):
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    nan_row = _valid_row("nan.jpg")
+    nan_row["fx"] = "nan"
+    nan_row["fy"] = "inf"
+    _write_test_csv(csv_path, [nan_row])
+
+    real_sparse = _get_scene("chair").sparse_dir
+    real_images = _get_scene("chair").train_images_dir
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_images,
+        sparse_dir=real_sparse, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any("fx" in p and "finite" in p.lower() for p in report.problems)
+    assert any("fy" in p and "finite" in p.lower() for p in report.problems)
+
+
+def test_validate_scene_flags_fractional_width_height(tmp_path):
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    fractional_row = _valid_row("fractional.jpg")
+    fractional_row["width"] = "640.5"
+    _write_test_csv(csv_path, [fractional_row])
+
+    real_sparse = _get_scene("chair").sparse_dir
+    real_images = _get_scene("chair").train_images_dir
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_images,
+        sparse_dir=real_sparse, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any("width" in p and "whole number" in p.lower() for p in report.problems)
+
+
+def test_validate_scene_flags_empty_image_name(tmp_path):
+    from src.common.config import SceneConfig
+
+    csv_path = tmp_path / "test_poses.csv"
+    _write_test_csv(csv_path, [_valid_row("")])
+
+    real_sparse = _get_scene("chair").sparse_dir
+    real_images = _get_scene("chair").train_images_dir
+    scene = SceneConfig(
+        name="fake", root=tmp_path, train_images_dir=real_images,
+        sparse_dir=real_sparse, test_poses_csv=csv_path,
+    )
+    report = validate_scene(scene)
+    assert any("empty image_name" in p.lower() for p in report.problems)
+
+
 def test_validate_scene_flags_test_pose_with_no_colmap_registration(tmp_path):
     # This IS the one case where a name outside train/images/ is a real
     # problem: a test pose whose image_name was never registered in
