@@ -29,8 +29,11 @@ def test_real_train_fn_skips_subprocess_when_checkpoint_already_at_target(tmp_pa
 def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run(argv, cwd, check):
+    captured_env = {}
+
+    def fake_run(argv, cwd, check, env):
         calls.append((argv, cwd, check))
+        captured_env.update(env)
         (tmp_path / "chkpnt30000.pth").touch()
 
     monkeypatch.setattr(gs_train_fn.subprocess, "run", fake_run)
@@ -44,6 +47,10 @@ def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path,
     assert "--start_checkpoint" not in argv
     assert "--checkpoint_iterations" in argv
     assert argv[argv.index("--checkpoint_iterations") + 1] == "30000"
+    # train.py's tqdm progress bar must flush live instead of block-
+    # buffering, or a genuinely-running multi-hour training looks stuck in
+    # Colab's output pane.
+    assert captured_env.get("PYTHONUNBUFFERED") == "1"
     assert result == tmp_path / "chkpnt30000.pth"
 
 
@@ -52,7 +59,7 @@ def test_real_train_fn_resumes_from_partial_checkpoint(tmp_path, monkeypatch):
     partial.touch()
     calls = []
 
-    def fake_run(argv, cwd, check):
+    def fake_run(argv, cwd, check, env):
         calls.append(argv)
         (tmp_path / "chkpnt30000.pth").touch()
 
@@ -100,7 +107,7 @@ def test_real_train_fn_retrains_when_scene_contents_changed(tmp_path, monkeypatc
 
     calls = []
 
-    def fake_run(argv, cwd, check):
+    def fake_run(argv, cwd, check, env):
         calls.append(argv)
         (output_dir / "chkpnt30000.pth").touch()
 
@@ -132,7 +139,7 @@ def test_real_train_fn_reuses_checkpoint_when_fingerprint_matches(tmp_path, monk
 
     calls = []
 
-    def fake_run(argv, cwd, check):
+    def fake_run(argv, cwd, check, env):
         calls.append(argv)
         (output_dir / "chkpnt30000.pth").touch()
 
@@ -163,7 +170,7 @@ def test_real_train_fn_retrains_when_image_content_changes_under_same_filename(t
 
     calls = []
 
-    def fake_run(argv, cwd, check):
+    def fake_run(argv, cwd, check, env):
         calls.append(argv)
         (output_dir / "chkpnt30000.pth").touch()
 

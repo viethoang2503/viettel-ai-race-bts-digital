@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -85,7 +86,14 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
         resume_checkpoint=existing,
         extra_args=["--checkpoint_iterations", str(iterations)],
     )
-    subprocess.run(argv, cwd=str(GS_ROOT), check=True)
+    # PYTHONUNBUFFERED forces train.py's own stdout (its tqdm progress bar
+    # in particular) to flush immediately instead of block-buffering —
+    # without it, Jupyter/Colab shows no output at all for long stretches
+    # because the child inherits a piped (non-tty) stdout, which Python
+    # buffers fully by default, making a genuinely-running 30k-iteration
+    # training look stuck instead of showing live progress.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    subprocess.run(argv, cwd=str(GS_ROOT), check=True, env=env)
 
     checkpoint = find_latest_checkpoint(output_dir)
     if checkpoint is None or (checkpoint_iteration(checkpoint) or 0) < iterations:
