@@ -2904,7 +2904,7 @@ Create `src/orchestrator/__init__.py` (empty).
 pytest tests/test_run_pipeline.py -v
 ```
 
-Expected: `PASS` (2 passed). Both tests use `_StubLpipsModel` and never call
+Expected: `PASS` (3 passed). All three tests use `_StubLpipsModel` and never call
 `load_lpips_model()`, so — unlike Task 6 Step 6 — this requires no network access at all.
 
 - [ ] **Step 5: Commit**
