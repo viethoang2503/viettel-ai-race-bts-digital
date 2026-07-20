@@ -30,3 +30,27 @@ def write_images_binary(images: dict, path: Path) -> None:
             ))
             fid.write(img.name.encode("utf-8") + b"\x00")
             fid.write(struct.pack("<Q", 0))  # num_points2D
+
+
+def write_cameras_binary(cameras: dict, path: Path) -> None:
+    """Write a COLMAP cameras.bin containing exactly the given cameras.
+
+    Only PINHOLE is supported (model_id=1, num_params=4, params
+    [fx, fy, cx, cy]) — the only model this pipeline ever writes, produced
+    by undistort_scene.py. Binary layout verified against
+    third_party/gaussian-splatting/scene/colmap_loader.py's
+    read_intrinsics_binary: uint64 num_cameras, then per camera
+    int32 camera_id, int32 model_id, uint64 width, uint64 height, then
+    num_params * float64 params.
+    """
+    path = Path(path)
+    with open(path, "wb") as fid:
+        fid.write(struct.pack("<Q", len(cameras)))
+        for camera_id, cam in cameras.items():
+            if cam.model != "PINHOLE":
+                raise ValueError(
+                    f"write_cameras_binary only supports PINHOLE, got {cam.model}"
+                )
+            fid.write(struct.pack("<iiQQ", int(camera_id), 1, int(cam.width), int(cam.height)))
+            fx, fy, cx, cy = cam.params
+            fid.write(struct.pack("<dddd", float(fx), float(fy), float(cx), float(cy)))
