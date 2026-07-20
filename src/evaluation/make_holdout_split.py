@@ -13,6 +13,9 @@ def select_holdout_images(
     poses that real test poses are likely to extrapolate toward, rather
     than a uniform every-Nth split.
     """
+    if not camera_centers:
+        raise ValueError("camera_centers is empty, cannot select holdout images")
+
     names = list(camera_centers.keys())
     centers = np.stack([camera_centers[n] for n in names], axis=0)
     centroid = centers.mean(axis=0)

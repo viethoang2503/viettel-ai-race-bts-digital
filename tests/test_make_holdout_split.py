@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from src.evaluation.make_holdout_split import select_holdout_images
 
@@ -23,3 +24,8 @@ def test_select_holdout_never_returns_empty_for_nonzero_ratio():
     centers = {"only_one": np.array([0.0, 0.0, 0.0])}
     holdout = select_holdout_images(centers, holdout_ratio=0.125)
     assert holdout == ["only_one"]
+
+
+def test_select_holdout_raises_on_empty_input():
+    with pytest.raises(ValueError, match="empty"):
+        select_holdout_images({}, holdout_ratio=0.125)
