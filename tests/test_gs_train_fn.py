@@ -74,3 +74,75 @@ def test_real_train_fn_raises_if_subprocess_produces_no_checkpoint(tmp_path, mon
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "30000" in str(e)
+
+
+def test_real_train_fn_retrains_when_scene_contents_changed(tmp_path, monkeypatch):
+    scene_dir = tmp_path / "scene_images"
+    scene_dir.mkdir()
+    (scene_dir / "0001.jpg").touch()
+    scene = SceneConfig(
+        name="chair", root=Path("VAI_NVS_DATA_ROUND2/chair"),
+        train_images_dir=scene_dir,
+        sparse_dir=Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0"),
+        test_poses_csv=Path("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv"),
+        submission_dir="chair",
+    )
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chkpnt30000.pth").touch()
+    (output_dir / "stale_marker.txt").touch()  # simulates leftover state from the old run
+    # A fingerprint recorded by a PRIOR real_train_fn call on different
+    # scene contents — deliberately does not match what _scene_fingerprint
+    # will compute for `scene` below, proving a real mismatch (not just an
+    # absent fingerprint) is what triggers the wipe.
+    (output_dir / gs_train_fn._FINGERPRINT_FILENAME).write_text("stale-fingerprint-from-old-data")
+
+    calls = []
+
+    def fake_run(argv, cwd, check):
+        calls.append(argv)
+        (output_dir / "chkpnt30000.pth").touch()
+
+    monkeypatch.setattr(gs_train_fn.subprocess, "run", fake_run)
+
+    result = gs_train_fn.real_train_fn(scene, output_dir, iterations=30000)
+
+    # The recorded fingerprint didn't match, so the old checkpoint must be
+    # treated as stale/untrusted and training must actually run, not skip.
+    assert len(calls) == 1
+    assert not (output_dir / "stale_marker.txt").exists(), (
+        "output_dir must be wiped before retraining on a fingerprint mismatch"
+    )
+    assert result == output_dir / "chkpnt30000.pth"
+
+
+def test_real_train_fn_reuses_checkpoint_when_fingerprint_matches(tmp_path, monkeypatch):
+    scene_dir = tmp_path / "scene_images"
+    scene_dir.mkdir()
+    (scene_dir / "0001.jpg").touch()
+    scene = SceneConfig(
+        name="chair", root=Path("VAI_NVS_DATA_ROUND2/chair"),
+        train_images_dir=scene_dir,
+        sparse_dir=Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0"),
+        test_poses_csv=Path("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv"),
+        submission_dir="chair",
+    )
+    output_dir = tmp_path / "output"
+
+    calls = []
+
+    def fake_run(argv, cwd, check):
+        calls.append(argv)
+        (output_dir / "chkpnt30000.pth").touch()
+
+    monkeypatch.setattr(gs_train_fn.subprocess, "run", fake_run)
+
+    # First call: trains from scratch and records a fingerprint.
+    gs_train_fn.real_train_fn(scene, output_dir, iterations=30000)
+    assert len(calls) == 1
+
+    # Second call, same scene contents: must skip, not retrain.
+    result = gs_train_fn.real_train_fn(scene, output_dir, iterations=30000)
+    assert len(calls) == 1  # unchanged — no new subprocess call
+    assert result == output_dir / "chkpnt30000.pth"
