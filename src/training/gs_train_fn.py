@@ -13,9 +13,34 @@ _FINGERPRINT_FILENAME = ".gs_train_fn_fingerprint"
 
 
 def _scene_fingerprint(scene: SceneConfig, iterations: int) -> str:
-    names = sorted(p.name for p in Path(scene.train_images_dir).iterdir() if p.is_file())
-    payload = f"{Path(scene.train_images_dir).resolve()}|{iterations}|{','.join(names)}"
-    return hashlib.sha256(payload.encode()).hexdigest()
+    """Hash of everything that determines what train.py would actually
+    train on: image file CONTENT (not just names — a same-named re-upload
+    with different pixels must not be mistaken for the same scene) plus the
+    sparse reconstruction's content (cameras.bin/images.bin/points3D.bin —
+    poses/intrinsics/points can change independently of the images).
+    """
+    digest = hashlib.sha256()
+    digest.update(f"{Path(scene.train_images_dir).resolve()}|{iterations}".encode())
+
+    image_paths = sorted(
+        (p for p in Path(scene.train_images_dir).iterdir() if p.is_file()),
+        key=lambda p: p.name,
+    )
+    for path in image_paths:
+        digest.update(path.name.encode())
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+
+    sparse_dir = Path(scene.sparse_dir)
+    for sparse_filename in ("cameras.bin", "images.bin", "points3D.bin"):
+        sparse_path = sparse_dir / sparse_filename
+        digest.update(sparse_filename.encode())
+        if sparse_path.is_file():
+            with open(sparse_path, "rb") as f:
+                digest.update(f.read())
+
+    return digest.hexdigest()
 
 
 def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000) -> Path:
