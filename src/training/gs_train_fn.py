@@ -25,6 +25,21 @@ _FINGERPRINT_FILENAME = ".gs_train_fn_fingerprint"
 _TRAIN_CONFIG_VERSION = "v2"
 
 
+def _checkpoint_schedule(iterations: int, interval: int = 5000) -> list[int]:
+    """Iteration numbers to checkpoint at: every `interval` iterations, plus
+    always `iterations` itself. Without intermediate saves, a Colab
+    disconnect at any point before the very last iteration loses 100% of
+    that training run's progress (train.py only ever saved a checkpoint at
+    the end) — with them, a resumed run picks up from the latest interval
+    instead of starting over, and the interval files double as a visible
+    progress indicator (which checkpoint files exist on Drive) when the
+    live progress bar output isn't visible in the notebook.
+    """
+    schedule = list(range(interval, iterations, interval))
+    schedule.append(iterations)
+    return schedule
+
+
 def _scene_fingerprint(scene: SceneConfig, iterations: int) -> str:
     """Hash of everything that determines what train.py would actually
     train on: image file CONTENT (not just names — a same-named re-upload
@@ -72,6 +87,10 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
     a later call (dataset re-uploaded, holdout selection changed, etc.),
     the checkpoint is not safe to trust — output_dir is wiped and training
     starts clean rather than risk silently shipping a stale model.
+
+    Checkpoints are saved every 5000 iterations (see _checkpoint_schedule),
+    not just at the end — a disconnect partway through resumes from the
+    latest interval instead of losing all progress from that run.
     """
     output_dir = Path(output_dir)
     fingerprint = _scene_fingerprint(scene, iterations)
@@ -98,7 +117,10 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
     argv = build_train_argv(
         scene, output_dir, iterations,
         resume_checkpoint=existing,
-        extra_args=["--checkpoint_iterations", str(iterations)],
+        extra_args=[
+            "--checkpoint_iterations",
+            *[str(i) for i in _checkpoint_schedule(iterations)],
+        ],
     )
     # PYTHONUNBUFFERED forces train.py's own stdout (its tqdm progress bar
     # in particular) to flush immediately instead of block-buffering —

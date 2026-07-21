@@ -47,7 +47,12 @@ def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path,
     assert check is True
     assert "--start_checkpoint" not in argv
     assert "--checkpoint_iterations" in argv
-    assert argv[argv.index("--checkpoint_iterations") + 1] == "30000"
+    # Saved every 5000 iterations, not just at the end — a Colab disconnect
+    # partway through must be able to resume from the latest interval
+    # instead of losing all progress from that run.
+    ckpt_idx = argv.index("--checkpoint_iterations")
+    checkpoint_values = argv[ckpt_idx + 1:ckpt_idx + 7]
+    assert checkpoint_values == ["5000", "10000", "15000", "20000", "25000", "30000"]
     # train.py's tqdm progress bar must flush live instead of block-
     # buffering, or a genuinely-running multi-hour training looks stuck in
     # Colab's output pane.
@@ -232,3 +237,17 @@ def test_real_train_fn_retrains_when_train_config_version_changes(tmp_path, monk
     assert len(calls) == 1, "old config version — must retrain, not skip"
     assert not (output_dir / "stale_marker.txt").exists()
     assert result == output_dir / "chkpnt30000.pth"
+
+
+def test_checkpoint_schedule_hits_every_interval_and_the_final_iteration():
+    assert gs_train_fn._checkpoint_schedule(30000, interval=5000) == [
+        5000, 10000, 15000, 20000, 25000, 30000,
+    ]
+
+
+def test_checkpoint_schedule_always_includes_final_iteration_even_if_not_a_multiple():
+    assert gs_train_fn._checkpoint_schedule(12000, interval=5000) == [5000, 10000, 12000]
+
+
+def test_checkpoint_schedule_handles_iterations_smaller_than_interval():
+    assert gs_train_fn._checkpoint_schedule(3000, interval=5000) == [3000]
