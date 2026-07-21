@@ -58,6 +58,13 @@ def test_build_train_argv_without_resume():
     assert "--start_checkpoint" not in argv
     import sys
     assert argv[0] == sys.executable
+    # Must always force native resolution: the vendored loader silently
+    # downscales any image wider than 1600px by default (--resolution=-1),
+    # which would train at a lower resolution than we render/score at —
+    # reproduced on a real Colab run (bonsai, 1920px wide) as a
+    # dramatically blurry render and PSNR ~14.8 vs. a sharp ground truth.
+    assert "--resolution" in argv
+    assert argv[argv.index("--resolution") + 1] == "1"
 
 
 def test_build_train_argv_with_resume_checkpoint():

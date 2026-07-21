@@ -56,6 +56,17 @@ def build_train_argv(
         "--source_path", str(Path(scene.gs_source_dir).resolve()),
         "--model_path", str(Path(output_dir).resolve()),
         "--iterations", str(iterations),
+        # Without this, the vendored loader auto-downscales any image
+        # wider than 1600px (its default --resolution=-1 behavior) — the
+        # real BTS/bonsai/chair scenes exceed that, so training would
+        # silently happen at a lower resolution than what we render at
+        # (test_poses.csv's exact width/height) and score against (the
+        # full-resolution holdout images). Reproduced on a real Colab run:
+        # bonsai (1920x1080) trained without this flag scored PSNR ~14.8
+        # with visibly blurry renders against a sharp ground truth —
+        # exactly the symptom of Gaussians optimized for a coarser pixel
+        # grid than they're displayed at. "1" forces native resolution.
+        "--resolution", "1",
     ]
     # Deliberately no --eval flag: the baseline's own --eval does an
     # internal 1/8-uniform-holdout split, which would (a) double-filter an
