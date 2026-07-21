@@ -63,6 +63,9 @@ def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path,
     # --start_checkpoint resume path (see environment/sitecustomize.py).
     pythonpath_entries = captured_env.get("PYTHONPATH", "").split(os.pathsep)
     assert str(gs_train_fn._SITECUSTOMIZE_DIR) in pythonpath_entries
+    # Reduces CUDA allocator fragmentation — suggested directly in the
+    # OutOfMemoryError message reproduced on a real Colab run.
+    assert captured_env.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True"
     assert result == tmp_path / "chkpnt30000.pth"
 
 

@@ -15,15 +15,22 @@ _FINGERPRINT_FILENAME = ".gs_train_fn_fingerprint"
 
 # Bump this whenever build_train_argv's fixed flags change in a way that
 # would produce a materially different checkpoint from the same scene data
-# (e.g. the --resolution 1 fix below) — the fingerprint otherwise only
-# tracks scene DATA, so a config-only change would be invisible to it and
-# a stale, wrongly-configured checkpoint would keep getting silently
-# reused forever. Bumped once already: v2 forces native --resolution
-# (v1 let the vendored loader auto-downscale anything wider than 1600px,
-# producing checkpoints trained at a different resolution than what this
-# pipeline renders/scores at — reproduced on a real Colab run as blurry
-# renders and PSNR ~14.8 on bonsai).
-_TRAIN_CONFIG_VERSION = "v2"
+# — the fingerprint otherwise only tracks scene DATA, so a config-only
+# change would be invisible to it and a stale, wrongly-configured
+# checkpoint would keep getting silently reused forever.
+# v2: forces native --resolution (v1 let the vendored loader
+#     auto-downscale anything wider than 1600px, producing checkpoints
+#     trained at a different resolution than what this pipeline
+#     renders/scores at — reproduced on a real Colab run as blurry
+#     renders and PSNR ~14.8 on bonsai).
+# v3: caps densification (--densify_grad_threshold, --densify_until_iter)
+#     — real BTS scenes can grow enough Gaussians to OOM a 22GB GPU
+#     before finishing (reproduced on a real Colab run, HCM0421, CUDA
+#     out of memory at iteration ~5300). A checkpoint grown under the
+#     old unbounded settings isn't safe to keep densifying under the new
+#     capped ones — different growth trajectory, not just a resumed
+#     continuation of the same one.
+_TRAIN_CONFIG_VERSION = "v3"
 
 
 def _checkpoint_schedule(iterations: int, interval: int = 5000) -> list[int]:
@@ -141,7 +148,16 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
     # edit here would never reach a fresh clone on Colab.
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
     pythonpath = str(_SITECUSTOMIZE_DIR) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": pythonpath}
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": pythonpath,
+        # Suggested directly in the CUDA OOM error message reproduced on a
+        # real Colab run: reduces allocator fragmentation, so memory
+        # PyTorch has reserved-but-not-yet-used can actually be reused
+        # instead of triggering a fresh (and possibly failing) allocation.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    }
     subprocess.run(argv, cwd=str(GS_ROOT), check=True, env=env)
 
     checkpoint = find_latest_checkpoint(output_dir)

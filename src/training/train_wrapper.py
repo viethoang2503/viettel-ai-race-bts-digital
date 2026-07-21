@@ -67,6 +67,23 @@ def build_train_argv(
         # exactly the symptom of Gaussians optimized for a coarser pixel
         # grid than they're displayed at. "1" forces native resolution.
         "--resolution", "1",
+        # Real BTS scenes can OOM a 22GB GPU well before reaching
+        # `iterations` — reproduced on a real Colab run (HCM0421, L4,
+        # 240 images): CUDA out of memory at iteration ~5300 during
+        # densify_and_prune, with the Gaussian count still growing (the
+        # vendored default densifies every 100 iterations from 500 to
+        # 15000, unbounded — no max-Gaussian-count flag exists in this
+        # version). Both flags below cut total growth: a stricter split/
+        # clone gradient threshold (5x the 0.0002 default) creates fewer
+        # new Gaussians per event, and stopping densification 5000
+        # iterations earlier caps how many events can happen at all. This
+        # also helps satisfy the exam's real inference constraint (spec
+        # section 7: BTC renders on a 20GB A4000, smaller than even this
+        # 22GB training GPU) at some cost to fine detail versus an
+        # unconstrained run — an unavoidable tradeoff given training
+        # itself can't complete without it.
+        "--densify_grad_threshold", "0.001",
+        "--densify_until_iter", "10000",
     ]
     # Deliberately no --eval flag: the baseline's own --eval does an
     # internal 1/8-uniform-holdout split, which would (a) double-filter an

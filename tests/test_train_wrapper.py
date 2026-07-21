@@ -65,6 +65,15 @@ def test_build_train_argv_without_resume():
     # dramatically blurry render and PSNR ~14.8 vs. a sharp ground truth.
     assert "--resolution" in argv
     assert argv[argv.index("--resolution") + 1] == "1"
+    # Must cap densification: real BTS scenes can OOM a 22GB GPU well
+    # before finishing training under the vendored defaults — reproduced
+    # on a real Colab run (HCM0421, L4, CUDA out of memory at iteration
+    # ~5300 during densify_and_prune, no built-in max-Gaussian-count flag
+    # exists in this vendored version to cap it more directly).
+    assert "--densify_grad_threshold" in argv
+    assert argv[argv.index("--densify_grad_threshold") + 1] == "0.001"
+    assert "--densify_until_iter" in argv
+    assert argv[argv.index("--densify_until_iter") + 1] == "10000"
 
 
 def test_build_train_argv_with_resume_checkpoint():
