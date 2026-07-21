@@ -10,6 +10,7 @@ from src.common.config import SceneConfig
 from src.training.train_wrapper import build_train_argv, checkpoint_iteration, find_latest_checkpoint
 
 GS_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "gaussian-splatting"
+_SITECUSTOMIZE_DIR = Path(__file__).resolve().parents[2] / "environment"
 _FINGERPRINT_FILENAME = ".gs_train_fn_fingerprint"
 
 # Bump this whenever build_train_argv's fixed flags change in a way that
@@ -128,7 +129,19 @@ def real_train_fn(scene: SceneConfig, output_dir: Path, iterations: int = 30000)
     # because the child inherits a piped (non-tty) stdout, which Python
     # buffers fully by default, making a genuinely-running 30k-iteration
     # training look stuck instead of showing live progress.
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    #
+    # PYTHONPATH prepends environment/ so Python auto-imports its
+    # sitecustomize.py at subprocess startup, patching torch.load to
+    # accept our own checkpoints under PyTorch 2.6+'s weights_only=True
+    # default — only matters on --start_checkpoint resume (a from-scratch
+    # run never calls torch.load(checkpoint) inside train.py at all), so
+    # it's easy to miss until a real Colab disconnect-and-resume happens.
+    # Can't patch third_party/gaussian-splatting/train.py directly: it's a
+    # git submodule pinned to graphdeco-inria's upstream repo, so a local
+    # edit here would never reach a fresh clone on Colab.
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath = str(_SITECUSTOMIZE_DIR) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": pythonpath}
     subprocess.run(argv, cwd=str(GS_ROOT), check=True, env=env)
 
     checkpoint = find_latest_checkpoint(output_dir)

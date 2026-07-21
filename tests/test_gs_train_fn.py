@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 
 from src.common.config import SceneConfig
@@ -57,6 +58,11 @@ def test_real_train_fn_runs_subprocess_from_scratch_when_no_checkpoint(tmp_path,
     # buffering, or a genuinely-running multi-hour training looks stuck in
     # Colab's output pane.
     assert captured_env.get("PYTHONUNBUFFERED") == "1"
+    # environment/ must be on PYTHONPATH so Python auto-imports its
+    # sitecustomize.py, patching torch.load for train.py's own
+    # --start_checkpoint resume path (see environment/sitecustomize.py).
+    pythonpath_entries = captured_env.get("PYTHONPATH", "").split(os.pathsep)
+    assert str(gs_train_fn._SITECUSTOMIZE_DIR) in pythonpath_entries
     assert result == tmp_path / "chkpnt30000.pth"
 
 
