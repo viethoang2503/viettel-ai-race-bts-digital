@@ -12,16 +12,30 @@ from src.training.train_wrapper import build_train_argv, checkpoint_iteration, f
 GS_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "gaussian-splatting"
 _FINGERPRINT_FILENAME = ".gs_train_fn_fingerprint"
 
+# Bump this whenever build_train_argv's fixed flags change in a way that
+# would produce a materially different checkpoint from the same scene data
+# (e.g. the --resolution 1 fix below) — the fingerprint otherwise only
+# tracks scene DATA, so a config-only change would be invisible to it and
+# a stale, wrongly-configured checkpoint would keep getting silently
+# reused forever. Bumped once already: v2 forces native --resolution
+# (v1 let the vendored loader auto-downscale anything wider than 1600px,
+# producing checkpoints trained at a different resolution than what this
+# pipeline renders/scores at — reproduced on a real Colab run as blurry
+# renders and PSNR ~14.8 on bonsai).
+_TRAIN_CONFIG_VERSION = "v2"
+
 
 def _scene_fingerprint(scene: SceneConfig, iterations: int) -> str:
     """Hash of everything that determines what train.py would actually
     train on: image file CONTENT (not just names — a same-named re-upload
-    with different pixels must not be mistaken for the same scene) plus the
+    with different pixels must not be mistaken for the same scene), the
     sparse reconstruction's content (cameras.bin/images.bin/points3D.bin —
-    poses/intrinsics/points can change independently of the images).
+    poses/intrinsics/points can change independently of the images), and
+    _TRAIN_CONFIG_VERSION (so a fixed-flag change invalidates old
+    checkpoints even when the scene data itself hasn't changed at all).
     """
     digest = hashlib.sha256()
-    digest.update(f"{Path(scene.train_images_dir).resolve()}|{iterations}".encode())
+    digest.update(f"{_TRAIN_CONFIG_VERSION}|{Path(scene.train_images_dir).resolve()}|{iterations}".encode())
 
     image_paths = sorted(
         (p for p in Path(scene.train_images_dir).iterdir() if p.is_file()),

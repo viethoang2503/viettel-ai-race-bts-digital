@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from src.common.config import SceneConfig
@@ -191,4 +192,43 @@ def test_real_train_fn_retrains_when_image_content_changes_under_same_filename(t
     assert not (output_dir / "stale_marker.txt").exists(), (
         "output_dir must be wiped before retraining on a content mismatch"
     )
+    assert result == output_dir / "chkpnt30000.pth"
+
+
+def test_real_train_fn_retrains_when_train_config_version_changes(tmp_path, monkeypatch):
+    # Same scene data, unchanged — but a checkpoint recorded under an OLDER
+    # _TRAIN_CONFIG_VERSION (e.g. before the --resolution 1 fix) must be
+    # treated as stale even though nothing about the scene itself changed.
+    scene_dir = tmp_path / "scene_images"
+    scene_dir.mkdir()
+    (scene_dir / "0001.jpg").write_bytes(b"pixel bytes")
+    scene = SceneConfig(
+        name="chair", root=Path("VAI_NVS_DATA_ROUND2/chair"),
+        train_images_dir=scene_dir,
+        sparse_dir=Path("VAI_NVS_DATA_ROUND2/chair/train/sparse/0"),
+        test_poses_csv=Path("VAI_NVS_DATA_ROUND2/chair/test/test_poses.csv"),
+        submission_dir="chair",
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "chkpnt30000.pth").touch()
+    (output_dir / "stale_marker.txt").touch()
+
+    old_fingerprint = hashlib.sha256(
+        f"old-config-version|{scene_dir.resolve()}|30000".encode()
+    ).hexdigest()
+    (output_dir / gs_train_fn._FINGERPRINT_FILENAME).write_text(old_fingerprint)
+
+    calls = []
+
+    def fake_run(argv, cwd, check, env):
+        calls.append(argv)
+        (output_dir / "chkpnt30000.pth").touch()
+
+    monkeypatch.setattr(gs_train_fn.subprocess, "run", fake_run)
+
+    result = gs_train_fn.real_train_fn(scene, output_dir, iterations=30000)
+
+    assert len(calls) == 1, "old config version — must retrain, not skip"
+    assert not (output_dir / "stale_marker.txt").exists()
     assert result == output_dir / "chkpnt30000.pth"
