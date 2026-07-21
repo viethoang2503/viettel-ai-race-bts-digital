@@ -22,6 +22,11 @@ from src.training.undistort_scene import undistort_scene
 @dataclass
 class PipelineResult:
     per_scene_scores: dict[str, float] = field(default_factory=dict)
+    # Mean lpips/ssim/psnr across holdout images, per scene — combine_score
+    # collapses these into one number; kept separately here so a low score
+    # can be diagnosed (e.g. "SSIM is fine but LPIPS is bad") instead of
+    # only ever seeing the single blended value.
+    per_scene_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     skipped_scenes: dict[str, list[str]] = field(default_factory=dict)
     validation_problems: list[str] = field(default_factory=list)
     submission_zip: Path | None = None
@@ -132,15 +137,22 @@ def run_baseline_pipeline(
         rendered_paths = render_fn(eval_checkpoint, holdout_params, holdout_render_dir)
 
         scores = []
+        per_image_metrics = []
         for path, params in zip(rendered_paths, holdout_params):
             gt_path = working_scene.train_images_dir / params.image_name
             pred = np.array(Image.open(path).convert("RGB"))
             gt = np.array(Image.open(gt_path).convert("RGB").resize(pred.shape[1::-1]))
             metrics = compute_pair_metrics(pred, gt, lpips_model)
+            per_image_metrics.append(metrics)
             scores.append(combine_score(
                 metrics["lpips"], metrics["ssim"], metrics["psnr"], psnr_max,
             ))
         result.per_scene_scores[scene.name] = float(np.mean(scores)) if scores else 0.0
+        if per_image_metrics:
+            result.per_scene_metrics[scene.name] = {
+                key: float(np.mean([m[key] for m in per_image_metrics]))
+                for key in ("lpips", "ssim", "psnr")
+            }
 
         # Phase B: final training on 100% of the real distributed training
         # data — still goes through build_filtered_scene (empty holdout)

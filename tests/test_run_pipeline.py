@@ -98,6 +98,15 @@ def test_run_baseline_pipeline_produces_scores_and_valid_zip(tmp_path):
     assert "chair" in result.per_scene_scores
     assert 0.0 <= result.per_scene_scores["chair"] <= 1.0
     assert result.submission_zip is not None
+
+    # combine_score blends lpips/ssim/psnr into one number — the raw
+    # per-metric averages must also be kept, so a low score can be
+    # diagnosed instead of only ever seeing the single blended value.
+    assert "chair" in result.per_scene_metrics
+    scene_metrics = result.per_scene_metrics["chair"]
+    assert set(scene_metrics.keys()) == {"lpips", "ssim", "psnr"}
+    for value in scene_metrics.values():
+        assert isinstance(value, float)
     assert result.submission_zip.exists()
     # black-image render vs real holdout images should not be a perfect score
     assert result.per_scene_scores["chair"] < 0.9
