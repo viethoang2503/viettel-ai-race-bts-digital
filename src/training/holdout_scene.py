@@ -54,11 +54,15 @@ def build_filtered_scene(
                 # OSError(errno 95, "Operation not supported") there.
                 # Fall back to a real copy, which works on every
                 # filesystem; local runs still get the cheap symlink.
-                shutil.copy2(src, dst)
+                # shutil.copy (not copy2): copy2 also tries to preserve
+                # mtime/permissions via os.utime/os.chmod, which Drive's
+                # FUSE mount may reject the same way it rejects symlinks
+                # — content is all that matters for training input.
+                shutil.copy(src, dst)
 
     write_images_binary(kept_images, sparse_out / "images.bin")
-    shutil.copy2(scene.sparse_dir / "cameras.bin", sparse_out / "cameras.bin")
-    shutil.copy2(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
+    shutil.copy(scene.sparse_dir / "cameras.bin", sparse_out / "cameras.bin")
+    shutil.copy(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
 
     return replace(
         scene,

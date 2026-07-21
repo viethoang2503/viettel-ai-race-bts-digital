@@ -45,8 +45,25 @@ def compute_pair_metrics(pred: np.ndarray, gt: np.ndarray, lpips_model) -> dict:
 
 
 def load_lpips_model(net: str = "alex"):
+    import torch
     import lpips
 
-    model = lpips.LPIPS(net=net)
+    # lpips's bundled weight file predates PyTorch 2.6's default
+    # torch.load(weights_only=True) — loading it unpatched raises
+    # UnpicklingError (numpy.core.multiarray.scalar not an allowed
+    # global). We trust this file (it ships inside the lpips PyPI
+    # package itself, not user-supplied), so force weights_only=False
+    # just for this load, then restore torch.load immediately after.
+    original_load = torch.load
+
+    def _load_trusting_source(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = _load_trusting_source
+    try:
+        model = lpips.LPIPS(net=net)
+    finally:
+        torch.load = original_load
     model.eval()
     return model

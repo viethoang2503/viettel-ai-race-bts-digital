@@ -45,7 +45,12 @@ def _default_opt_and_pipe():
 def _load_gaussians(checkpoint_path: Path):
     from scene.gaussian_model import GaussianModel
 
-    model_args, _first_iter = torch.load(checkpoint_path)
+    # weights_only=False: this is our own checkpoint, produced by
+    # gaussians.capture() (a tuple of tensors + optimizer state dict, not
+    # just a plain state_dict) — PyTorch 2.6's default weights_only=True
+    # rejects the plain Python types mixed into that tuple/optimizer
+    # state. Trusted since we produced it ourselves in this same pipeline.
+    model_args, _first_iter = torch.load(checkpoint_path, weights_only=False)
     opt, _pipe = _default_opt_and_pipe()
     gaussians = GaussianModel(sh_degree=3)  # matches ModelParams default
     gaussians.restore(model_args, opt)

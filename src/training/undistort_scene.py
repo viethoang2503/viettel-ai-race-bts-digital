@@ -79,7 +79,7 @@ def undistort_scene(scene: SceneConfig, output_dir: Path) -> SceneConfig:
         dst_path = images_out / img.name
         mapping = undistort_maps[img.camera_id]
         if mapping is None:
-            shutil.copy2(src_path, dst_path)
+            shutil.copy(src_path, dst_path)
             continue
         k_matrix, dist_coeffs = mapping
         pixels = cv2.imread(str(src_path))
@@ -89,7 +89,7 @@ def undistort_scene(scene: SceneConfig, output_dir: Path) -> SceneConfig:
         cv2.imwrite(str(dst_path), undistorted)
 
     write_cameras_binary(new_cameras, sparse_out / "cameras.bin")
-    shutil.copy2(scene.sparse_dir / "images.bin", sparse_out / "images.bin")
-    shutil.copy2(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
+    shutil.copy(scene.sparse_dir / "images.bin", sparse_out / "images.bin")
+    shutil.copy(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
 
     return replace(scene, root=output_dir, train_images_dir=images_out, sparse_dir=sparse_out)
