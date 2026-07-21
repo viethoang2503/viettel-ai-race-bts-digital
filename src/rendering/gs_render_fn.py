@@ -53,6 +53,23 @@ def _load_gaussians(checkpoint_path: Path):
     model_args, _first_iter = torch.load(checkpoint_path, weights_only=False)
     opt, _pipe = _default_opt_and_pipe()
     gaussians = GaussianModel(sh_degree=3)  # matches ModelParams default
+    # GaussianModel.restore() unconditionally calls training_setup(), which
+    # builds an optimizer over self._exposure — but that attribute is only
+    # ever created by create_from_pcd() (the fresh-training path in
+    # train.py's Scene.__init__), never by restore() itself. A render-only
+    # load skips create_from_pcd entirely (no point cloud, no camera list —
+    # we're rendering novel test poses from an already-trained checkpoint),
+    # so without this, training_setup() crashes with
+    # AttributeError: 'GaussianModel' object has no attribute '_exposure'
+    # (an actual Colab traceback). The placeholder's VALUE is irrelevant:
+    # gaussian_renderer.render()'s use_trained_exp defaults to False and is
+    # never overridden by real_render_fn below, so the exposure correction
+    # is never applied during rendering — only _exposure's existence and
+    # shape (matching create_from_pcd's [N, 3, 4] identity-transform
+    # convention) matter, not its content.
+    gaussians._exposure = torch.nn.Parameter(
+        torch.eye(3, 4, device="cuda")[None].requires_grad_(True)
+    )
     gaussians.restore(model_args, opt)
     return gaussians
 
