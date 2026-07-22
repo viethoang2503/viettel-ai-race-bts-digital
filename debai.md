@@ -106,9 +106,11 @@ Thí sinh có thể submit nhiều lần trong thời gian mở; hệ thống gh
 
 | Scene | Train | Test poses | Resolution | Loại |
 |---|---|---|---|---|
-| HCM0421, HCM0539, HCM0540, HCM0644, HCM0674 | 240 | 60 | 1320×989 | Ảnh drone DJI thật — **trọng tâm chấm điểm** |
-| chair | 205 | 58 | 720×1280 | Video hand-held — scene tham chiếu |
-| bonsai | 248 | 28 | 1920×1080 | Scene chuẩn Mip-NeRF360 công khai — dùng đối chiếu số liệu published |
+| HCM0421, HCM0539, HCM0540, HCM0644, HCM0674 | 240 | 60 | 1320×989 | Ảnh drone DJI thật — trọng tâm chấm điểm |
+| chair | 205 | 58 | 720×1280 | Video hand-held |
+| bonsai | 248 | 28 | 1920×1080 | Scene chuẩn Mip-NeRF360 công khai |
+
+**Đính chính (2026-07-22):** cả 7 scene đều nằm trong gói private test #1 BTC cấp và **đều cần có mặt trong `submission.zip`** — xác nhận trực tiếp từ người dùng, phụ trách bài thi. Nhận định trước đó trong tài liệu này (cho rằng `chair`/`bonsai` chỉ là scene tham chiếu, không cần nộp) là **sai**, đã dẫn đến bỏ sót 2 scene khi đóng gói submission đầu tiên — xem `notebooks/colab_runner_bonsai.ipynb` (đổi tên/mục đích: giờ dùng để train `bonsai`+`chair` cho submission thật, không chỉ để validate) và bước ghép 7 scene ở `notebooks/colab_runner_hcm.ipynb` Bước 8.
 
 Xác nhận: `test/` chỉ chứa `test_poses.csv`, **không có ảnh ground-truth** — đúng với quy định cấm truy xuất test data. `cameras.bin` có `cx=width/2, cy=height/2` chính xác ở cả 7 scene → camera model PINHOLE/SIMPLE_PINHOLE, tương thích thẳng với baseline. Sparse point cloud dày (15-22MB/scene ở nhóm HCM) → khởi tạo Gaussian tốt.
 
@@ -138,7 +140,7 @@ Xác nhận: `test/` chỉ chứa `test_poses.csv`, **không có ảnh ground-tr
 
 - Giai đoạn phát triển: tự tạo holdout từ ảnh train (chọn ở rìa vùng phủ quỹ đạo, không random đều, để mô phỏng đúng độ khó extrapolation) — dùng cờ `--eval` sẵn có trong baseline.
 - Giai đoạn nộp bài: train lại 100% dữ liệu train, render "mù" theo `test_poses.csv` thật (không đối chiếu được), dựa vào QA thủ công bằng mắt + độ tin cậy của bước validate ở trên.
-- `bonsai` dùng để kiểm chứng hàm tính metric của mình có khớp với số liệu Mip-NeRF360 published hay không, trước khi tin vào số đo trên 5 scene BTS.
+- `bonsai` cũng dùng để kiểm chứng hàm tính metric của mình có khớp với số liệu Mip-NeRF360 published hay không, trước khi tin vào số đo trên 5 scene BTS — **nhưng đây là lợi ích PHỤ**, không phải lý do duy nhất nó có trong dataset: cả `bonsai` và `chair` đều phải xuất hiện trong `submission.zip` cuối cùng (xem đính chính ở mục 2.1).
 
 ### 2.6 Định hướng triển khai đã thống nhất
 
