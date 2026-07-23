@@ -2,46 +2,878 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the diagnosis step, screening/final-iteration split, bounded per-scene
-hyperparameter search, and final-assembly wiring defined in
-`docs/superpowers/specs/2026-07-23-score-push-design.md`, so the 7-scene baseline
-(Score ≈0.622) can be pushed toward ≈0.80 within the remaining 7-day window.
+**Goal:** Implement everything needed to push the 7-scene baseline (Score ≈0.622) toward ≈0.80
+within the remaining 7-day window: the advanced-techniques building blocks (VRAM guard, floater
+pruning, depth regularization, appearance embedding, auto-select, reproducibility bundle) plus
+the diagnosis step, screening/final-iteration split, and bounded per-scene hyperparameter search
+defined in `docs/superpowers/specs/2026-07-23-score-push-design.md`.
 
-**Architecture:** Pure-Python/pure-math pieces (diagnosis ranking, tie-break decision,
-hyperparameter candidate list construction) get real `pytest` unit tests on the local no-GPU
-machine, exactly like Plan 1 and the advanced-techniques plan. The orchestrator
-(`run_experiment_matrix_pipeline`) and the training-loop modification are GPU-dependent — written
-completely against the vendored API, but flagged for manual verification/adjustment on Colab,
-like every GPU-touching task in this repo so far.
+**Architecture:** Pure-Python/pure-math pieces (VRAM estimation, floater mask computation, sparse
+depth target computation, appearance-embedding tensor math, depth-loss tensor math, candidate
+selection, diagnosis ranking, tie-break decision, hyperparameter candidate construction,
+reproducibility bundle) get real `pytest` unit tests on the local no-GPU machine. The pieces that
+require the actual differentiable CUDA rasterizer (the training loop itself, the checkpoint prune
+wrapper, the experiment-matrix orchestrator's GPU-touching calls) are written completely against
+the vendored API as documented in the upstream repo, but flagged for manual verification on
+Colab, since this local machine cannot execute CUDA code to verify them directly.
 
-**Tech Stack:** Same as Plan 1/2 (Python 3.10+, PyTorch, `lpips`, `scikit-image`, `numpy`,
-`pyyaml`, `pytest`), the vendored `graphdeco-inria/gaussian-splatting` submodule.
+**Tech Stack:** Python 3.10+, PyTorch, `lpips`, `scikit-image`, `numpy`, `pyyaml`, `pytest`, the
+vendored `graphdeco-inria/gaussian-splatting` submodule at `third_party/gaussian-splatting`.
+
+**Note on provenance:** this plan supersedes and fully absorbs
+`docs/superpowers/plans/2026-07-18-advanced-techniques.md` — Tasks 1-8 and 10 below carry that
+document's already-reviewed design over verbatim (or with a small, explicitly-noted correction).
+Do not execute `2026-07-18-advanced-techniques.md` directly; execute this document instead. Its
+own Task 11 (visual QA) is the one piece already implemented — `src/submission/visual_qa.py`, in
+use since Plan 1 — and is not repeated here.
 
 ## Global Constraints
 
-- **Prerequisite — must be done first, unmodified:** Tasks 1-7 and Task 10 of
-  `docs/superpowers/plans/2026-07-18-advanced-techniques.md` (VRAM guard, floater/background
-  prune mask, sparse depth targets, appearance embedding, depth regularization loss, auto-select
-  best config, anti-aliasing flag confirmation) are complete, self-contained, and correct as
-  written there — implement them exactly as specified (use `subagent-driven-development` or
-  `executing-plans` directly on that document for these tasks) before starting Task 1 below. Task
-  11 of that document (visual QA) is **already implemented** at `src/submission/visual_qa.py` —
-  skip it.
-- **Deliberately NOT implemented from that document: Task 8 as originally written, and Task 9.**
-  This plan's Task 5 implements Task 8's `src/training/train_variant.py` with one added
-  parameter (`hyperparam_overrides`) baked in from the start — do not implement Task 8 verbatim
-  first and then modify it. This plan's Task 6 fully replaces Task 9's
-  `run_experiment_matrix_pipeline` — do not implement that document's Task 9 at all.
 - Deadline: 30/07/2026. GPU: Google Colab Pro, L4, one session at a time (no parallel-session
   dependency). GPU cost is not a constraint; calendar time is.
 - Tests: run with `.venv/bin/python -m pytest -q` (system `python3` lacks `pytest`).
 - Submission format constraint (exam spec 1.5): `submission.zip` must contain **only** per-scene
   rendered images — reproducibility artifacts (config YAML, score CSVs) must be written to a
   **separate** zip/folder, never merged into `submission.zip`.
+- Real BTS scenes are `SIMPLE_RADIAL`; the vendored 3DGS only handles `PINHOLE`/`SIMPLE_PINHOLE`
+  — every task that trains or renders must go through Plan 1's `undistort_scene` first, never the
+  raw `SceneConfig`.
 
 ---
 
-### Task 1: Per-image holdout metrics for diagnosis
+### Task 1: VRAM budget guard
+
+**Files:**
+- Create: `src/postprocess/vram_guard.py`
+- Test: `tests/test_vram_guard.py`
+
+**Interfaces:**
+- Produces:
+  - `count_gaussians_in_ply(ply_path: Path) -> int` — parses the ASCII PLY header (`element
+    vertex N`) without loading the (potentially large) binary body.
+  - `estimate_vram_bytes(num_gaussians: int, sh_degree: int = 3, dtype_bytes: int = 4) -> int`
+    — a **conservative heuristic**, not a guaranteed prediction; the authoritative check is
+    always `torch.cuda.max_memory_allocated()` measured for real on Colab (Step 6).
+  - `fits_within_vram_budget(ply_path: Path, budget_bytes: int) -> bool`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_vram_guard.py
+from pathlib import Path
+
+import pytest
+
+from src.postprocess.vram_guard import (
+    count_gaussians_in_ply,
+    estimate_vram_bytes,
+    fits_within_vram_budget,
+)
+
+
+def _write_fake_ply(path: Path, num_vertices: int) -> None:
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {num_vertices}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "end_header\n"
+    )
+    path.write_bytes(header.encode("ascii") + b"\x00" * (num_vertices * 12))
+
+
+def test_count_gaussians_in_ply_reads_header_only(tmp_path):
+    ply_path = tmp_path / "cloud.ply"
+    _write_fake_ply(ply_path, 12345)
+    assert count_gaussians_in_ply(ply_path) == 12345
+
+
+def test_estimate_vram_bytes_scales_linearly_with_count():
+    small = estimate_vram_bytes(1000)
+    large = estimate_vram_bytes(2000)
+    assert large == pytest.approx(2 * small, rel=1e-6)
+    assert small > 0
+
+
+def test_estimate_vram_bytes_increases_with_sh_degree():
+    low_degree = estimate_vram_bytes(1000, sh_degree=0)
+    high_degree = estimate_vram_bytes(1000, sh_degree=3)
+    assert high_degree > low_degree
+
+
+def test_fits_within_vram_budget_true_for_small_cloud(tmp_path):
+    ply_path = tmp_path / "small.ply"
+    _write_fake_ply(ply_path, 1000)
+    assert fits_within_vram_budget(ply_path, budget_bytes=16 * 1024**3) is True
+
+
+def test_fits_within_vram_budget_false_for_absurdly_large_cloud(tmp_path):
+    ply_path = tmp_path / "huge.ply"
+    _write_fake_ply(ply_path, 1)  # header claims 1, we lie about the count instead:
+    ply_path.write_bytes(
+        ply_path.read_bytes().replace(b"element vertex 1\n", b"element vertex 500000000\n")
+    )
+    assert fits_within_vram_budget(ply_path, budget_bytes=16 * 1024**3) is False
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_vram_guard.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.postprocess'`.
+
+- [ ] **Step 3: Write `src/postprocess/vram_guard.py`**
+
+```python
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def count_gaussians_in_ply(ply_path: Path) -> int:
+    with open(ply_path, "rb") as f:
+        for raw_line in f:
+            line = raw_line.decode("ascii", errors="ignore").strip()
+            if line.startswith("element vertex"):
+                return int(line.split()[-1])
+            if line == "end_header":
+                break
+    raise ValueError(f"no 'element vertex' line found in PLY header: {ply_path}")
+
+
+def estimate_vram_bytes(num_gaussians: int, sh_degree: int = 3, dtype_bytes: int = 4) -> int:
+    """Conservative heuristic estimate of VRAM needed to RENDER (not train)
+    a checkpoint with this many Gaussians at the given SH degree.
+    """
+    floats_per_gaussian = 3 + 4 + 3 + 1 + (sh_degree + 1) ** 2 * 3
+    rendering_overhead_multiplier = 2.0
+    return int(num_gaussians * floats_per_gaussian * dtype_bytes * rendering_overhead_multiplier)
+
+
+def fits_within_vram_budget(ply_path: Path, budget_bytes: int, sh_degree: int = 3) -> bool:
+    num_gaussians = count_gaussians_in_ply(ply_path)
+    return estimate_vram_bytes(num_gaussians, sh_degree=sh_degree) <= budget_bytes
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_vram_guard.py -v`
+Expected: `PASS` (5 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/postprocess/vram_guard.py src/postprocess/__init__.py tests/test_vram_guard.py
+git commit -m "Add VRAM budget estimation guard for A4000 inference target"
+```
+
+- [ ] **Step 6: Manual verification on Colab (requires GPU)**
+
+After rendering a real checkpoint (any Plan 1 scene), compare the heuristic against reality:
+
+```python
+import torch
+from src.postprocess.vram_guard import count_gaussians_in_ply, estimate_vram_bytes
+
+torch.cuda.reset_peak_memory_stats()
+# ... run the real render for one scene ...
+actual_bytes = torch.cuda.max_memory_allocated()
+n = count_gaussians_in_ply("path/to/point_cloud.ply")
+print("estimated:", estimate_vram_bytes(n), "actual:", actual_bytes)
+```
+
+If the heuristic underestimates actual usage by more than ~30%, tighten the
+`rendering_overhead_multiplier` before relying on it in Task 6's auto-selection.
+
+---
+
+### Task 2: Floater/background prune mask
+
+**Files:**
+- Create: `src/postprocess/prune_floaters.py`
+- Test: `tests/test_prune_floaters.py`
+
+**Interfaces:**
+- Consumes: `compute_scene_bbox` (Plan 1, `src/common/colmap_io.py`).
+- Produces: `compute_prune_mask(xyz: np.ndarray, opacity: np.ndarray, scales: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarray, opacity_threshold: float = 0.05, max_scale_percentile: float = 99.5) -> np.ndarray`
+  returning a boolean `(N,)` keep-mask (`True` = keep). A Gaussian is pruned if its center is
+  outside `[bbox_min, bbox_max]`, its opacity is below `opacity_threshold`, or its largest scale
+  axis is above the `max_scale_percentile`-th percentile of all Gaussians' largest scale axis
+  (percentile-based, not an absolute cutoff, so it doesn't need per-scene retuning).
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_prune_floaters.py
+import numpy as np
+
+from src.postprocess.prune_floaters import compute_prune_mask
+
+
+def test_keeps_normal_gaussians_inside_bbox():
+    xyz = np.array([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]])
+    opacity = np.array([0.5, 0.8])
+    scales = np.array([[0.1, 0.1, 0.1], [0.1, 0.1, 0.1]])
+    mask = compute_prune_mask(
+        xyz, opacity, scales, bbox_min=np.array([-1, -1, -1]), bbox_max=np.array([1, 1, 1]),
+    )
+    assert mask.tolist() == [True, True]
+
+
+def test_prunes_gaussian_outside_bbox():
+    xyz = np.array([[0.0, 0.0, 0.0], [100.0, 100.0, 100.0]])
+    opacity = np.array([0.5, 0.5])
+    scales = np.array([[0.1, 0.1, 0.1], [0.1, 0.1, 0.1]])
+    mask = compute_prune_mask(
+        xyz, opacity, scales, bbox_min=np.array([-1, -1, -1]), bbox_max=np.array([1, 1, 1]),
+    )
+    assert mask.tolist() == [True, False]
+
+
+def test_prunes_low_opacity_gaussian():
+    xyz = np.array([[0.0, 0.0, 0.0], [0.1, 0.1, 0.1]])
+    opacity = np.array([0.5, 0.01])
+    scales = np.array([[0.1, 0.1, 0.1], [0.1, 0.1, 0.1]])
+    mask = compute_prune_mask(
+        xyz, opacity, scales, bbox_min=np.array([-1, -1, -1]), bbox_max=np.array([1, 1, 1]),
+        opacity_threshold=0.05,
+    )
+    assert mask.tolist() == [True, False]
+
+
+def test_prunes_outlier_scale_gaussian():
+    xyz = np.tile(np.array([0.0, 0.0, 0.0]), (100, 1))
+    opacity = np.full(100, 0.5)
+    scales = np.full((100, 3), 0.1)
+    scales[0] = [50.0, 50.0, 50.0]  # one giant outlier
+    mask = compute_prune_mask(
+        xyz, opacity, scales, bbox_min=np.array([-1, -1, -1]), bbox_max=np.array([1, 1, 1]),
+        max_scale_percentile=99.5,
+    )
+    assert mask[0] == False
+    assert mask[1:].all()
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_prune_floaters.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.postprocess.prune_floaters'`.
+
+- [ ] **Step 3: Write `src/postprocess/prune_floaters.py`**
+
+```python
+from __future__ import annotations
+
+import numpy as np
+
+
+def compute_prune_mask(
+    xyz: np.ndarray, opacity: np.ndarray, scales: np.ndarray,
+    bbox_min: np.ndarray, bbox_max: np.ndarray,
+    opacity_threshold: float = 0.05, max_scale_percentile: float = 99.5,
+) -> np.ndarray:
+    inside_bbox = np.all((xyz >= bbox_min) & (xyz <= bbox_max), axis=1)
+    opaque_enough = opacity >= opacity_threshold
+
+    max_scale_per_gaussian = scales.max(axis=1)
+    scale_cutoff = np.percentile(max_scale_per_gaussian, max_scale_percentile)
+    not_outlier_scale = max_scale_per_gaussian <= scale_cutoff
+
+    return inside_bbox & opaque_enough & not_outlier_scale
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_prune_floaters.py -v`
+Expected: `PASS` (4 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/postprocess/prune_floaters.py tests/test_prune_floaters.py
+git commit -m "Add floater/background prune mask computation"
+```
+
+---
+
+### Task 3: Sparse depth targets from COLMAP tracks
+
+**Files:**
+- Create: `src/training/sparse_depth.py`
+- Test: `tests/test_sparse_depth.py`
+
+**Interfaces:**
+- Produces: `compute_sparse_depth_targets(qvec: np.ndarray, tvec: np.ndarray, xys: np.ndarray, point3d_ids: np.ndarray, points3d: dict) -> tuple[np.ndarray, np.ndarray]`
+  returning `(pixel_xy, depth)` arrays for every 2D keypoint in this training image that has a
+  valid associated 3D point (`point3d_ids[i] != -1`). `pixel_xy` comes directly from the observed
+  COLMAP keypoint location, not a re-projection. `depth` is the camera-space Z of that 3D point,
+  computed using the **raw COLMAP world-to-camera** `(R, t)` — deliberately NOT the transposed
+  convention used for the vendored `Camera` class, since depth is a camera-space quantity.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_sparse_depth.py
+import numpy as np
+
+from src.training.sparse_depth import compute_sparse_depth_targets
+
+
+class _FakePoint3D:
+    def __init__(self, xyz):
+        self.xyz = np.array(xyz)
+
+
+def test_identity_rotation_depth_equals_camera_z_translation():
+    qvec = np.array([1.0, 0.0, 0.0, 0.0])  # identity rotation
+    tvec = np.array([0.0, 0.0, 5.0])
+    xys = np.array([[10.0, 20.0]])
+    point3d_ids = np.array([0])
+    points3d = {0: _FakePoint3D([0.0, 0.0, 0.0])}  # world origin
+
+    pixel_xy, depth = compute_sparse_depth_targets(qvec, tvec, xys, point3d_ids, points3d)
+
+    assert pixel_xy.shape == (1, 2)
+    np.testing.assert_allclose(pixel_xy[0], [10.0, 20.0])
+    np.testing.assert_allclose(depth, [5.0], atol=1e-10)
+
+
+def test_filters_out_unassociated_keypoints():
+    qvec = np.array([1.0, 0.0, 0.0, 0.0])
+    tvec = np.array([0.0, 0.0, 5.0])
+    xys = np.array([[10.0, 20.0], [30.0, 40.0]])
+    point3d_ids = np.array([0, -1])  # second keypoint has no 3D point
+    points3d = {0: _FakePoint3D([0.0, 0.0, 0.0])}
+
+    pixel_xy, depth = compute_sparse_depth_targets(qvec, tvec, xys, point3d_ids, points3d)
+
+    assert pixel_xy.shape == (1, 2)
+    assert depth.shape == (1,)
+
+
+def test_filters_out_point_ids_not_present_in_points3d_dict():
+    qvec = np.array([1.0, 0.0, 0.0, 0.0])
+    tvec = np.array([0.0, 0.0, 5.0])
+    xys = np.array([[10.0, 20.0]])
+    point3d_ids = np.array([999])  # not in points3d
+    points3d = {0: _FakePoint3D([0.0, 0.0, 0.0])}
+
+    pixel_xy, depth = compute_sparse_depth_targets(qvec, tvec, xys, point3d_ids, points3d)
+
+    assert pixel_xy.shape == (0, 2)
+    assert depth.shape == (0,)
+
+
+def test_nonzero_translation_and_offset_point():
+    qvec = np.array([1.0, 0.0, 0.0, 0.0])
+    tvec = np.array([1.0, 2.0, 3.0])
+    xys = np.array([[0.0, 0.0]])
+    point3d_ids = np.array([0])
+    points3d = {0: _FakePoint3D([0.0, 0.0, 2.0])}  # world point at z=2
+
+    pixel_xy, depth = compute_sparse_depth_targets(qvec, tvec, xys, point3d_ids, points3d)
+
+    np.testing.assert_allclose(depth, [5.0], atol=1e-10)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_sparse_depth.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.training.sparse_depth'`.
+
+- [ ] **Step 3: Write `src/training/sparse_depth.py`**
+
+```python
+from __future__ import annotations
+
+import numpy as np
+
+from src.common.pose_utils import qvec2rotmat
+
+
+def compute_sparse_depth_targets(
+    qvec: np.ndarray,
+    tvec: np.ndarray,
+    xys: np.ndarray,
+    point3d_ids: np.ndarray,
+    points3d: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    r_world_to_cam = qvec2rotmat(np.asarray(qvec, dtype=np.float64))
+    t_world_to_cam = np.asarray(tvec, dtype=np.float64)
+
+    valid = np.array([
+        pid != -1 and pid in points3d for pid in point3d_ids
+    ])
+
+    pixel_xy = np.asarray(xys)[valid]
+    valid_ids = np.asarray(point3d_ids)[valid]
+
+    depths = []
+    for pid in valid_ids:
+        world_xyz = points3d[pid].xyz
+        cam_xyz = r_world_to_cam @ world_xyz + t_world_to_cam
+        depths.append(cam_xyz[2])
+
+    return pixel_xy.reshape(-1, 2), np.array(depths, dtype=np.float64)
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_sparse_depth.py -v`
+Expected: `PASS` (4 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/training/sparse_depth.py tests/test_sparse_depth.py
+git commit -m "Add sparse depth target computation from COLMAP 2D-3D tracks"
+```
+
+---
+
+### Task 4: Appearance embedding (pure tensor math)
+
+**Files:**
+- Create: `src/training/appearance_embedding.py`
+- Test: `tests/test_appearance_embedding.py`
+
+**Interfaces:**
+- Produces:
+  - `AppearanceEmbedding(nn.Module)` — one learnable `(3,3)` affine + `(3,)` bias per training
+    image, initialized to identity/zero so training starts as a no-op.
+  - `apply_appearance(rgb: torch.Tensor, affine: torch.Tensor, bias: torch.Tensor) -> torch.Tensor`
+    — `rgb` is `(3, H, W)` in `[0,1]`; applies `affine @ rgb_pixel + bias` per pixel, clamped
+    back to `[0,1]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_appearance_embedding.py
+import torch
+
+from src.training.appearance_embedding import AppearanceEmbedding, apply_appearance
+
+
+def test_identity_affine_and_zero_bias_is_a_no_op():
+    rgb = torch.rand(3, 4, 4)
+    affine = torch.eye(3)
+    bias = torch.zeros(3)
+    out = apply_appearance(rgb, affine, bias)
+    torch.testing.assert_close(out, rgb)
+
+
+def test_bias_shifts_every_pixel():
+    rgb = torch.zeros(3, 2, 2)
+    affine = torch.eye(3)
+    bias = torch.tensor([0.1, 0.0, 0.0])
+    out = apply_appearance(rgb, affine, bias)
+    assert torch.allclose(out[0], torch.full((2, 2), 0.1))
+    assert torch.allclose(out[1], torch.zeros(2, 2))
+
+
+def test_output_is_clamped_to_valid_range():
+    rgb = torch.ones(3, 2, 2)
+    affine = torch.eye(3) * 2.0
+    bias = torch.zeros(3)
+    out = apply_appearance(rgb, affine, bias)
+    assert out.max() <= 1.0
+    assert out.min() >= 0.0
+
+
+def test_appearance_embedding_module_initializes_to_identity_no_op():
+    module = AppearanceEmbedding(num_images=3)
+    rgb = torch.rand(3, 4, 4)
+    for image_idx in range(3):
+        affine, bias = module(image_idx)
+        out = apply_appearance(rgb, affine, bias)
+        torch.testing.assert_close(out, rgb, atol=1e-6, rtol=1e-6)
+
+
+def test_appearance_embedding_has_learnable_parameters_per_image():
+    module = AppearanceEmbedding(num_images=5)
+    params = list(module.parameters())
+    assert len(params) > 0
+    assert all(p.requires_grad for p in params)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_appearance_embedding.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.training.appearance_embedding'`.
+
+- [ ] **Step 3: Write `src/training/appearance_embedding.py`**
+
+```python
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+def apply_appearance(rgb: torch.Tensor, affine: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    c, h, w = rgb.shape
+    flat = rgb.reshape(c, h * w)
+    transformed = affine @ flat + bias.unsqueeze(1)
+    return transformed.reshape(c, h, w).clamp(0.0, 1.0)
+
+
+class AppearanceEmbedding(nn.Module):
+    """One learnable (3,3) affine + (3,) bias per training image. Must
+    never be applied when rendering novel test poses -- there is no "true"
+    appearance code for an unseen view; use mean_affine_bias() instead.
+    """
+
+    def __init__(self, num_images: int):
+        super().__init__()
+        self.affine = nn.Parameter(torch.eye(3).unsqueeze(0).repeat(num_images, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(num_images, 3))
+
+    def forward(self, image_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.affine[image_idx], self.bias[image_idx]
+
+    def mean_affine_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.affine.mean(dim=0).detach(), self.bias.mean(dim=0).detach()
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_appearance_embedding.py -v`
+Expected: `PASS` (5 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/training/appearance_embedding.py tests/test_appearance_embedding.py
+git commit -m "Add per-image appearance embedding module with mean-fallback for novel views"
+```
+
+---
+
+### Task 5: Depth regularization loss (pure tensor math)
+
+**Files:**
+- Create: `src/training/depth_loss.py`
+- Test: `tests/test_depth_loss.py`
+
+**Interfaces:**
+- Consumes: `compute_sparse_depth_targets` (Task 3).
+- Produces: `depth_regularization_loss(rendered_depth: torch.Tensor, pixel_xy: np.ndarray, sparse_depths: np.ndarray) -> torch.Tensor`
+  — `rendered_depth` is `(H, W)`; samples it at the given integer-rounded pixel coordinates and
+  returns the mean L1 distance to `sparse_depths`. Returns `torch.tensor(0.0)` when there are
+  zero sparse points, so the training loop can always add this term unconditionally.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_depth_loss.py
+import numpy as np
+import pytest
+import torch
+
+from src.training.depth_loss import depth_regularization_loss
+
+
+def test_zero_loss_when_rendered_depth_matches_targets_exactly():
+    rendered_depth = torch.full((10, 10), 5.0)
+    pixel_xy = np.array([[3.0, 4.0], [7.0, 2.0]])
+    sparse_depths = np.array([5.0, 5.0])
+    loss = depth_regularization_loss(rendered_depth, pixel_xy, sparse_depths)
+    assert loss.item() == 0.0
+
+
+def test_positive_loss_when_rendered_depth_differs():
+    rendered_depth = torch.full((10, 10), 5.0)
+    pixel_xy = np.array([[3.0, 4.0]])
+    sparse_depths = np.array([8.0])
+    loss = depth_regularization_loss(rendered_depth, pixel_xy, sparse_depths)
+    assert loss.item() == pytest.approx(3.0, abs=1e-5)
+
+
+def test_zero_loss_and_no_crash_with_no_sparse_points():
+    rendered_depth = torch.full((10, 10), 5.0)
+    pixel_xy = np.zeros((0, 2))
+    sparse_depths = np.zeros((0,))
+    loss = depth_regularization_loss(rendered_depth, pixel_xy, sparse_depths)
+    assert loss.item() == 0.0
+    assert not torch.isnan(loss)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_depth_loss.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.training.depth_loss'`.
+
+- [ ] **Step 3: Write `src/training/depth_loss.py`**
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+
+def depth_regularization_loss(
+    rendered_depth: torch.Tensor, pixel_xy: np.ndarray, sparse_depths: np.ndarray,
+) -> torch.Tensor:
+    if len(sparse_depths) == 0:
+        return torch.tensor(0.0, device=rendered_depth.device)
+
+    height, width = rendered_depth.shape
+    cols = np.clip(np.round(pixel_xy[:, 0]).astype(int), 0, width - 1)
+    rows = np.clip(np.round(pixel_xy[:, 1]).astype(int), 0, height - 1)
+
+    sampled = rendered_depth[rows, cols]
+    targets = torch.as_tensor(sparse_depths, dtype=sampled.dtype, device=sampled.device)
+    return torch.abs(sampled - targets).mean()
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_depth_loss.py -v`
+Expected: `PASS` (3 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/training/depth_loss.py tests/test_depth_loss.py
+git commit -m "Add sparse-depth L1 regularization loss"
+```
+
+---
+
+### Task 6: Auto-select best config per scene
+
+**Files:**
+- Create: `src/evaluation/select_best_config.py`
+- Test: `tests/test_select_best_config.py`
+
+**Interfaces:**
+- Produces: `select_best_candidate(candidates: list[dict], vram_budget_bytes: int) -> dict`
+  where each candidate dict has keys `variant: str`, `floater_cleanup: bool`, `score: float`,
+  `estimated_vram_bytes: int`, `checkpoint_path: str` (and, from Task 11, optionally
+  `candidate_name`/`hyperparam_overrides`). Filters to candidates with
+  `estimated_vram_bytes <= vram_budget_bytes`; among those, returns the one with the highest
+  `score`. If none fit the budget, returns the smallest-`estimated_vram_bytes` candidate instead
+  and sets `fallback_reason: "no candidate fit the VRAM budget"`, rather than raising — a scene
+  must always ship *something*.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_select_best_config.py
+from src.evaluation.select_best_config import select_best_candidate
+
+
+def _candidate(variant, floater_cleanup, score, vram_bytes):
+    return {
+        "variant": variant, "floater_cleanup": floater_cleanup, "score": score,
+        "estimated_vram_bytes": vram_bytes, "checkpoint_path": f"{variant}_{floater_cleanup}.ply",
+    }
+
+
+def test_picks_highest_score_among_candidates_that_fit_budget():
+    candidates = [
+        _candidate("baseline", False, score=0.70, vram_bytes=1_000),
+        _candidate("full_stack", True, score=0.85, vram_bytes=1_500),
+        _candidate("depth_reg", False, score=0.78, vram_bytes=1_200),
+    ]
+    best = select_best_candidate(candidates, vram_budget_bytes=2_000)
+    assert best["variant"] == "full_stack"
+    assert "fallback_reason" not in best
+
+
+def test_excludes_candidates_over_vram_budget_even_if_higher_score():
+    candidates = [
+        _candidate("full_stack", True, score=0.95, vram_bytes=999_999),  # too big
+        _candidate("baseline", False, score=0.70, vram_bytes=1_000),
+    ]
+    best = select_best_candidate(candidates, vram_budget_bytes=2_000)
+    assert best["variant"] == "baseline"
+
+
+def test_falls_back_to_smallest_when_nothing_fits_budget():
+    candidates = [
+        _candidate("full_stack", True, score=0.95, vram_bytes=999_999),
+        _candidate("depth_reg", False, score=0.80, vram_bytes=500_000),
+    ]
+    best = select_best_candidate(candidates, vram_budget_bytes=2_000)
+    assert best["variant"] == "depth_reg"
+    assert best["fallback_reason"] == "no candidate fit the VRAM budget"
+
+
+def test_raises_on_empty_candidate_list():
+    import pytest
+    with pytest.raises(ValueError):
+        select_best_candidate([], vram_budget_bytes=2_000)
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_select_best_config.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.evaluation.select_best_config'`.
+
+- [ ] **Step 3: Write `src/evaluation/select_best_config.py`**
+
+```python
+from __future__ import annotations
+
+
+def select_best_candidate(candidates: list[dict], vram_budget_bytes: int) -> dict:
+    if not candidates:
+        raise ValueError("select_best_candidate requires at least one candidate")
+
+    fitting = [c for c in candidates if c["estimated_vram_bytes"] <= vram_budget_bytes]
+    if fitting:
+        return max(fitting, key=lambda c: c["score"])
+
+    smallest = min(candidates, key=lambda c: c["estimated_vram_bytes"])
+    return {**smallest, "fallback_reason": "no candidate fit the VRAM budget"}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_select_best_config.py -v`
+Expected: `PASS` (4 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/evaluation/select_best_config.py tests/test_select_best_config.py
+git commit -m "Add VRAM-aware best-candidate selection per scene"
+```
+
+---
+
+### Task 7: Anti-aliasing variant — confirm the baseline's native `antialiasing` flag
+
+The vendored `graphdeco-inria/gaussian-splatting` already ships native anti-aliasing — this is
+not a different rasterizer, just a boolean the render loop already reads. No new files, no
+submodule to vendor, no CUDA to rebuild per variant.
+
+**Files:** none — this task only records a verified finding and defines a contract Task 13
+implements.
+
+- [ ] **Step 1: Confirm the flag exists in the checkout (no code change)**
+
+```bash
+cd "/home/howard/Documents/viettel ai race/computer vision"
+grep -n "antialiasing" third_party/gaussian-splatting/arguments/__init__.py
+grep -n "antialiasing" third_party/gaussian-splatting/gaussian_renderer/__init__.py
+```
+
+Expected: `PipelineParams` defines `self.antialiasing = False`, and `render()` reads
+`antialiasing=pipe.antialiasing`. If either grep comes back empty (an older submodule pin), STOP
+and escalate — only then would vendoring Mip-Splatting become necessary.
+
+- [ ] **Step 2: Record the mapping (no code, just the contract Task 13 implements)**
+
+The `anti_alias` and `full_stack` training variants set `pipe.antialiasing = True` for both the
+training render loop AND every later render of that checkpoint (holdout eval and the final
+`test_poses.csv` render). A checkpoint trained with anti-aliasing on must be rendered with it on.
+
+---
+
+### Task 8: Reproducibility bundle
+
+**Files:**
+- Create: `src/submission/reproducibility_bundle.py`
+- Test: `tests/test_reproducibility_bundle.py`
+
+**Interfaces:**
+- Produces: `write_reproducibility_bundle(scene_name: str, chosen_config: dict, all_candidates: list[dict], output_dir: Path) -> Path`
+  — writes `output_dir/<scene_name>/chosen_config.yaml`,
+  `output_dir/<scene_name>/all_candidates_scores.csv`, returns `output_dir/<scene_name>`. Per
+  exam spec 1.7, this is what gets handed to the organizers if requested — config + full score
+  comparison table, so the choice of variant per scene is traceable and justified.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_reproducibility_bundle.py
+import csv
+
+import yaml
+
+from src.submission.reproducibility_bundle import write_reproducibility_bundle
+
+
+def test_write_reproducibility_bundle_creates_config_and_scores_csv(tmp_path):
+    chosen_config = {
+        "variant": "full_stack", "floater_cleanup": True, "score": 0.87,
+        "estimated_vram_bytes": 12_000_000_000, "checkpoint_path": "final.ply",
+    }
+    all_candidates = [
+        chosen_config,
+        {"variant": "baseline", "floater_cleanup": False, "score": 0.70,
+         "estimated_vram_bytes": 8_000_000_000, "checkpoint_path": "b.ply"},
+    ]
+
+    bundle_dir = write_reproducibility_bundle(
+        "chair", chosen_config, all_candidates, tmp_path,
+    )
+
+    assert bundle_dir == tmp_path / "chair"
+    config_path = bundle_dir / "chosen_config.yaml"
+    assert config_path.exists()
+    loaded = yaml.safe_load(config_path.read_text())
+    assert loaded["variant"] == "full_stack"
+
+    csv_path = bundle_dir / "all_candidates_scores.csv"
+    assert csv_path.exists()
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 2
+    assert {row["variant"] for row in rows} == {"full_stack", "baseline"}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/test_reproducibility_bundle.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.submission.reproducibility_bundle'`.
+
+- [ ] **Step 3: Write `src/submission/reproducibility_bundle.py`**
+
+```python
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import yaml
+
+
+def write_reproducibility_bundle(
+    scene_name: str, chosen_config: dict, all_candidates: list[dict], output_dir: Path,
+) -> Path:
+    bundle_dir = Path(output_dir) / scene_name
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(bundle_dir / "chosen_config.yaml", "w") as f:
+        yaml.safe_dump(chosen_config, f)
+
+    fieldnames = ["variant", "floater_cleanup", "score", "estimated_vram_bytes", "checkpoint_path"]
+    with open(bundle_dir / "all_candidates_scores.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for candidate in sorted(all_candidates, key=lambda c: -c["score"]):
+            writer.writerow({k: candidate.get(k) for k in fieldnames})
+
+    return bundle_dir
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `.venv/bin/python -m pytest tests/test_reproducibility_bundle.py -v`
+Expected: `PASS` (1 passed).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/submission/reproducibility_bundle.py tests/test_reproducibility_bundle.py
+git commit -m "Add reproducibility bundle writer (config + full candidate score table per scene)"
+```
+
+---
+
+### Task 9: Per-image holdout metrics for diagnosis
 
 **Files:**
 - Create: `src/diagnostics/__init__.py` (empty)
@@ -51,11 +883,10 @@ like every GPU-touching task in this repo so far.
 **Interfaces:**
 - Consumes: `compute_pair_metrics(pred, gt, lpips_model) -> dict` and
   `combine_score(lpips_val, ssim_val, psnr_val, psnr_max) -> float` from
-  `src/evaluation/compute_metrics.py` (already implemented, Plan 1).
+  `src/evaluation/compute_metrics.py` (Plan 1).
 - Produces: `compute_per_image_metrics(pred_dir: Path, gt_dir: Path, lpips_model, psnr_max: float) -> dict[str, dict[str, float]]`
   — maps `image_name -> {"lpips": ..., "ssim": ..., "psnr": ..., "score": ...}` for every file in
-  `pred_dir` that has a same-named file in `gt_dir`; files with no match are skipped, not errored
-  (a scene's `holdout_render/` may legitimately not cover every ground-truth file).
+  `pred_dir` that has a same-named file in `gt_dir`; files with no match are skipped, not errored.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -169,14 +1000,14 @@ git commit -m "Add per-image holdout metrics for scene diagnosis"
 
 ---
 
-### Task 2: Rank holdout images worst-first
+### Task 10: Rank holdout images worst-first
 
 **Files:**
 - Modify: `src/diagnostics/scene_diagnosis.py`
 - Test: `tests/test_scene_diagnosis.py`
 
 **Interfaces:**
-- Consumes: the `dict[str, dict[str, float]]` shape produced by Task 1's
+- Consumes: the `dict[str, dict[str, float]]` shape produced by Task 9's
   `compute_per_image_metrics` (each value has a `"score"` key).
 - Produces: `rank_holdout_by_score(per_image_metrics: dict[str, dict[str, float]]) -> list[tuple[str, float]]`
   — `(image_name, score)` pairs sorted ascending by score (worst first).
@@ -234,7 +1065,7 @@ git commit -m "Add worst-first holdout ranking for scene diagnosis"
 
 ---
 
-### Task 3: Screening tie-break and bounded hyperparameter candidates
+### Task 11: Screening tie-break and bounded hyperparameter candidates
 
 **Files:**
 - Create: `src/evaluation/screening.py`
@@ -244,13 +1075,11 @@ git commit -m "Add worst-first holdout ranking for scene diagnosis"
 - Produces:
   - `needs_tiebreak_rerun(candidates: list[dict], threshold: float = 0.01) -> list[str]` — given
     dicts with `"variant"` and `"score"` keys, returns the `variant` names (excluding the single
-    highest scorer) whose score is within `threshold` of the leader — these must be re-verified
-    at full iterations before a winner is trusted (spec section 5).
+    highest scorer) whose score is within `threshold` of the leader.
   - `build_hyperparam_candidates(base_overrides: dict[str, object], extra_overrides: list[dict[str, object]], label_prefix: str) -> list[dict[str, object]]`
     — for each entry in `extra_overrides`, merges it on top of `base_overrides` and tags the
     result with a unique `candidate_name` (`f"{label_prefix}_{i}"`). Deliberately NOT a
-    combinatorial grid — `extra_overrides` is a hand-picked, bounded list (spec: max 4 per
-    scene), not every parameter crossed with every other.
+    combinatorial grid — a hand-picked, bounded list (spec: max 4 per scene).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -343,20 +1172,20 @@ git commit -m "Add screening tie-break decision and bounded hyperparameter candi
 
 ---
 
-### Task 4: Diagnosis notebook cell (Giai đoạn 0)
+### Task 12: Diagnosis notebook cell (Giai đoạn 0)
 
 **Files:**
 - Modify: `notebooks/colab_runner_hcm.ipynb`
 
 **Interfaces:**
-- Consumes: `compute_per_image_metrics`, `rank_holdout_by_score` (Task 1/2); the already-existing
+- Consumes: `compute_per_image_metrics`, `rank_holdout_by_score` (Task 9/10); the already-existing
   `OUTPUT_ROOT/<scene>/holdout_render/` directories and `undistort_scene` (Plan 1) — both already
   on Drive from the finished Plan 1 baseline run, so this costs no GPU time, only CPU + human
   eyeballing.
 
 No GPU-dependent training code in this task, but it is Colab-only (needs the already-mounted
-Drive + `load_lpips_model()` from the finished Plan 1 run) so there is no local `pytest` step —
-verify manually on Colab per Step 2.
+Drive + `load_lpips_model()`) so there is no local `pytest` step — verify manually on Colab per
+Step 2.
 
 - [ ] **Step 1: Insert a new markdown + code cell after the existing Bước 7 cell**
 
@@ -403,7 +1232,6 @@ for scene in all_7_scenes:
 
     fig, axes = plt.subplots(2, len(worst), figsize=(5 * len(worst), 10))
     for i, (name, score) in enumerate(worst):
-        Image.open(pred_dir / name).convert("RGB")
         axes[0, i].imshow(Image.open(pred_dir / name).convert("RGB"))
         axes[0, i].set_title(f"predicted: {name}")
         axes[0, i].axis("off")
@@ -420,7 +1248,7 @@ Run this cell after Bước 7 with Drive mounted (Bước 2) and the environment
 each of the 7 scenes, confirm: predicted/ground-truth pairs display side by side, LPIPS/SSIM/PSNR
 values are printed, and no exception is raised for scenes whose `holdout_render/` already exists
 from the finished Plan 1 run. Note down, per scene (especially `bonsai`/`chair`), what the worst
-frames have in common — this human judgment feeds Task 7's `extra_overrides` choice for Giai
+frames have in common — this human judgment feeds Task 16's `extra_overrides` choice for Giai
 đoạn 2.
 
 - [ ] **Step 3: Commit**
@@ -432,119 +1260,380 @@ git commit -m "Add holdout diagnosis cell (Buoc 8) for pre-training-investment t
 
 ---
 
-### Task 5: Add hyperparameter override support to the variant training loop
+### Task 13: Variant-aware training loop with hyperparameter overrides
+
+This is the one piece of this plan that cannot be given a from-scratch, independently-verified
+implementation without the actual checked-out vendored source in front of the implementer — it
+directly drives the CUDA-differentiable renderer. It is written completely, reusing the
+pure/tested pieces from Tasks 3-5, against the well-established vendored API (`GaussianModel`,
+`render()`, `l1_loss`/`ssim` from `utils.loss_utils`) — but must be verified against the actual
+checked-out `third_party/gaussian-splatting/train.py` before trusting it.
 
 **Files:**
-- Modify: `src/training/train_variant.py` (created by the prerequisite Task 8 of
-  `docs/superpowers/plans/2026-07-18-advanced-techniques.md` — see Global Constraints)
-- Modify: `tests/test_train_variant.py`
+- Create: `src/training/train_variant.py`
+- Test: `tests/test_train_variant.py` (variant config logic only — no GPU)
 
 **Interfaces:**
-- Modifies: `run_training_variant(scene, variant, output_dir, iterations) -> Path` gains a 5th
-  parameter, `hyperparam_overrides: dict[str, object] | None = None`. Unknown override keys
-  raise `ValueError` immediately rather than silently doing nothing — a typo here would otherwise
-  waste a full Colab training run before anyone notices the override never applied.
+- Produces:
+  - `TrainingVariant` frozen dataclass: `name: str`, `use_depth_reg: bool`, `use_anti_alias: bool`,
+    `use_appearance_embed: bool`.
+  - `ALL_TRAINING_VARIANTS: list[TrainingVariant]` — `baseline`, `depth_reg`, `anti_alias`,
+    `appearance_embed`, `full_stack`.
+  - `run_training_variant(scene: SceneConfig, variant: TrainingVariant, output_dir: Path, iterations: int, hyperparam_overrides: dict[str, object] | None = None) -> Path`
+    — GPU-dependent; runs the actual training loop and returns the final checkpoint `.ply` path.
+    Unknown override keys raise `ValueError` immediately rather than silently doing nothing — a
+    typo would otherwise waste a full Colab run before anyone notices the override never applied.
 
-- [ ] **Step 1: Write the failing test (append to `tests/test_train_variant.py`)**
+- [ ] **Step 1: Write the failing test (variant config only, no GPU)**
 
 ```python
+# tests/test_train_variant.py
+import inspect
+
+from src.training.train_variant import ALL_TRAINING_VARIANTS, TrainingVariant, run_training_variant
+
+
+def test_all_training_variants_have_unique_names():
+    names = [v.name for v in ALL_TRAINING_VARIANTS]
+    assert len(names) == len(set(names))
+    assert set(names) == {"baseline", "depth_reg", "anti_alias", "appearance_embed", "full_stack"}
+
+
+def test_baseline_variant_has_no_techniques_enabled():
+    baseline = next(v for v in ALL_TRAINING_VARIANTS if v.name == "baseline")
+    assert baseline.use_depth_reg is False
+    assert baseline.use_anti_alias is False
+    assert baseline.use_appearance_embed is False
+
+
+def test_full_stack_variant_has_all_techniques_enabled():
+    full_stack = next(v for v in ALL_TRAINING_VARIANTS if v.name == "full_stack")
+    assert full_stack.use_depth_reg is True
+    assert full_stack.use_anti_alias is True
+    assert full_stack.use_appearance_embed is True
+
+
 def test_run_training_variant_signature_accepts_hyperparam_overrides():
-    import inspect
-
-    from src.training.train_variant import run_training_variant
-
     params = inspect.signature(run_training_variant).parameters
     assert "hyperparam_overrides" in params
     assert params["hyperparam_overrides"].default is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_train_variant.py -v -k hyperparam_overrides`
-Expected: `FAIL` — `AssertionError` (parameter not present yet).
+Run: `.venv/bin/python -m pytest tests/test_train_variant.py -v`
+Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.training.train_variant'`.
 
-- [ ] **Step 3: Modify `run_training_variant` in `src/training/train_variant.py`**
-
-Change the function signature from:
+- [ ] **Step 3: Write `src/training/train_variant.py`**
 
 ```python
-def run_training_variant(
-    scene: SceneConfig, variant: TrainingVariant, output_dir: Path, iterations: int,
-) -> Path:
-```
+from __future__ import annotations
 
-to:
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 
-```python
+from src.common.config import SceneConfig
+
+_VENDORED_REPO = Path(__file__).resolve().parents[2] / "third_party" / "gaussian-splatting"
+if str(_VENDORED_REPO) not in sys.path:
+    sys.path.insert(0, str(_VENDORED_REPO))
+
+
+@dataclass(frozen=True)
+class TrainingVariant:
+    name: str
+    use_depth_reg: bool
+    use_anti_alias: bool
+    use_appearance_embed: bool
+
+
+ALL_TRAINING_VARIANTS: list[TrainingVariant] = [
+    TrainingVariant("baseline", False, False, False),
+    TrainingVariant("depth_reg", True, False, False),
+    TrainingVariant("anti_alias", False, True, False),
+    TrainingVariant("appearance_embed", False, False, True),
+    TrainingVariant("full_stack", True, True, True),
+]
+
+
+def _build_dataset_args(gs_source_dir: Path, model_path: Path, use_anti_alias: bool):
+    """Construct the args object the vendored Scene/render expect. Rather
+    than hand-roll a Namespace and risk missing a field, build the real
+    ModelParams/PipelineParams/OptimizationParams via an ArgumentParser
+    (their ParamGroup base fills every default), then override the few
+    paths we control. Returns (dataset, pipe, opt).
+    """
+    from argparse import ArgumentParser
+    from arguments import ModelParams, OptimizationParams, PipelineParams
+
+    parser = ArgumentParser()
+    lp = ModelParams(parser)
+    op = OptimizationParams(parser)
+    pp = PipelineParams(parser)
+    args = parser.parse_args([])  # all defaults
+
+    dataset = lp.extract(args)
+    dataset.source_path = str(Path(gs_source_dir).resolve())
+    dataset.model_path = str(Path(model_path).resolve())
+    dataset.eval = False  # holdout handling is done upstream by the orchestrator
+
+    pipe = pp.extract(args)
+    pipe.antialiasing = use_anti_alias  # Task 7: native flag, no separate rasterizer
+
+    opt = op.extract(args)
+    return dataset, pipe, opt
+
+
 def run_training_variant(
     scene: SceneConfig, variant: TrainingVariant, output_dir: Path, iterations: int,
     hyperparam_overrides: dict[str, object] | None = None,
 ) -> Path:
-```
+    """GPU-dependent training loop for one variant. Mirrors the vendored
+    train.py::training() structure, verified against the checked-out
+    third_party/gaussian-splatting (commit 54c035f).
+    """
+    import torch
+    from random import randint
 
-And immediately after the existing line `opt.iterations = iterations` (inside the function body,
-before `gaussians = GaussianModel(dataset.sh_degree)`), add:
+    from gaussian_renderer import render as gs_render
+    from scene import GaussianModel, Scene
+    from utils.loss_utils import l1_loss, ssim
 
-```python
+    from src.common.colmap_io import load_sparse_scene
+    from src.training.appearance_embedding import AppearanceEmbedding, apply_appearance
+    from src.training.depth_loss import depth_regularization_loss
+    from src.training.sparse_depth import compute_sparse_depth_targets
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset, pipe, opt = _build_dataset_args(
+        scene.gs_source_dir, output_dir, variant.use_anti_alias,
+    )
+    opt.iterations = iterations
+
     for key, value in (hyperparam_overrides or {}).items():
         if not hasattr(opt, key):
             raise ValueError(f"unknown training hyperparameter override: {key!r}")
         setattr(opt, key, value)
+
+    gaussians = GaussianModel(dataset.sh_degree)
+    gs_scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
+
+    sparse = load_sparse_scene(scene.sparse_dir) if variant.use_depth_reg else None
+
+    train_cameras = gs_scene.getTrainCameras()
+    appearance = (
+        AppearanceEmbedding(num_images=len(train_cameras)).cuda()
+        if variant.use_appearance_embed else None
+    )
+    if appearance is not None:
+        appearance_optimizer = torch.optim.Adam(appearance.parameters(), lr=1e-3)
+
+    bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+
+    for iteration in range(1, iterations + 1):
+        gaussians.update_learning_rate(iteration)
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+
+        viewpoint_cam = train_cameras[randint(0, len(train_cameras) - 1)]
+        render_pkg = gs_render(viewpoint_cam, gaussians, pipe, bg_color)
+        image = render_pkg["render"]
+        viewspace_points = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
+
+        if appearance is not None:
+            affine, bias = appearance(viewpoint_cam.uid)
+            image = apply_appearance(image, affine, bias)
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        loss = (1.0 - opt.lambda_dssim) * l1_loss(image, gt_image) \
+            + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        if variant.use_depth_reg:
+            colmap_image = sparse.images[viewpoint_cam.colmap_id]
+            pixel_xy, sparse_depths = compute_sparse_depth_targets(
+                colmap_image.qvec, colmap_image.tvec,
+                colmap_image.xys, colmap_image.point3D_ids, sparse.points3d,
+            )
+            loss = loss + 0.1 * depth_regularization_loss(
+                render_pkg["depth"], pixel_xy, sparse_depths,
+            )
+
+        loss.backward()
+
+        with torch.no_grad():
+            if iteration < opt.densify_until_iter:
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter], radii[visibility_filter],
+                )
+                gaussians.add_densification_stats(viewspace_points, visibility_filter)
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold, 0.005,
+                        gs_scene.cameras_extent, size_threshold, radii,
+                    )
+                if iteration % opt.opacity_reset_interval == 0:
+                    gaussians.reset_opacity()
+
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            if appearance is not None:
+                appearance_optimizer.step()
+                appearance_optimizer.zero_grad(set_to_none=True)
+
+    if appearance is not None:
+        _save_mean_appearance(appearance, output_dir)
+
+    gs_scene.save(iterations)
+    final_ply = output_dir / "point_cloud" / f"iteration_{iterations}" / "point_cloud.ply"
+    return final_ply
+
+
+def _save_mean_appearance(appearance, output_dir: Path) -> None:
+    import torch
+
+    affine, bias = appearance.mean_affine_bias()
+    torch.save(
+        {"affine": affine.cpu(), "bias": bias.cpu()},
+        Path(output_dir) / "mean_appearance.pt",
+    )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+Note on anti-aliasing (Task 7): the `anti_alias`/`full_stack` variants set
+`pipe.antialiasing = True` via `_build_dataset_args`. The render step used later for holdout
+eval and the final `test_poses.csv` render MUST set the same flag for that checkpoint.
+
+- [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_train_variant.py -v`
-Expected: `PASS` (4 passed — the 3 original `ALL_TRAINING_VARIANTS` tests plus the new signature
-test).
+Expected: `PASS` (4 passed) — these tests only exercise `ALL_TRAINING_VARIANTS` and the
+`run_training_variant` signature, not its body (GPU-dependent, verified on Colab in Step 6).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/training/train_variant.py tests/test_train_variant.py
-git commit -m "Add hyperparameter override support to the variant training loop"
+git commit -m "Add variant-aware training loop with hyperparameter override support"
 ```
 
-- [ ] **Step 6: Manual verification on Colab (required, not optional)**
+- [ ] **Step 6: Manual verification and correction on Colab (required, not optional)**
 
-Before trusting this on a real Giai đoạn 2 run: call `run_training_variant` for the `baseline`
-variant on `chair` with `hyperparam_overrides={"densify_grad_threshold": 0.0005}` for a short
-`iterations=200` smoke run, and print `opt.densify_grad_threshold` right after the override loop
-to confirm it actually changed from the vendored default (`0.0002`). Also confirm
-`hyperparam_overrides={"not_a_real_field": 1}` raises `ValueError` immediately rather than
-starting training.
+Run in this order and fix any remaining mismatch before trusting it:
+1. `"baseline"` variant on the `chair` scene (cheapest) — confirm it produces
+   `point_cloud/iteration_<N>/point_cloud.ply` and that Plan 1's `render_all` can load and render
+   it without error.
+2. Then `depth_reg`, `anti_alias`, `appearance_embed` each individually.
+3. Only then `full_stack`.
+4. `hyperparam_overrides={"densify_grad_threshold": 0.0005}` for a short `iterations=200` smoke
+   run on `baseline`/`chair` — print `opt.densify_grad_threshold` right after the override loop
+   to confirm it actually changed from the vendored default (`0.0002`). Confirm
+   `hyperparam_overrides={"not_a_real_field": 1}` raises `ValueError` immediately.
+
+Known things most likely to still need adjustment on real hardware: whether `Scene.save` writes
+exactly to `point_cloud/iteration_<N>/point_cloud.ply` for this submodule pin, and whether
+`viewpoint_cam.uid` is the right per-image index for the appearance embedding (must be a stable
+0..N-1 index over `getTrainCameras()`; if not, enumerate the camera list instead).
 
 ---
 
-### Task 6: Corrected experiment-matrix orchestrator
+### Task 14: Checkpoint-level floater prune wrapper
+
+**Files:**
+- Modify: `src/postprocess/prune_floaters.py` (Task 2 only produces `compute_prune_mask`, a
+  boolean-array function; this task wraps the actual file I/O)
+
+**Interfaces:**
+- Consumes: `compute_prune_mask` (Task 2).
+- Produces: `prune_checkpoint(checkpoint_path: Path, bbox_min: np.ndarray, bbox_max: np.ndarray, sh_degree: int = 3) -> Path`
+  — loads the `.ply` at `checkpoint_path` via the vendored `GaussianModel.load_ply`, prunes
+  floaters via `compute_prune_mask`, saves the result as `<stem>_pruned.ply` next to the
+  original, and returns that path. This is the exact `prune_fn` callable Task 15's
+  `run_experiment_matrix_pipeline` (and Task 16's notebook cells) inject.
+
+This wraps the vendored `GaussianModel.load_ply`/`.prune_points`/`.save_ply` (verified present in
+the checked-out `third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), which
+hardcode `device="cuda"` internally — same GPU-dependent category as Task 13, so there is no
+local `pytest` step; `compute_prune_mask` itself (Task 2) already has its own local tests.
+
+- [ ] **Step 1: Append to `src/postprocess/prune_floaters.py`**
+
+```python
+def prune_checkpoint(checkpoint_path, bbox_min, bbox_max, sh_degree: int = 3):
+    from pathlib import Path
+
+    import torch
+
+    from scene import GaussianModel
+
+    checkpoint_path = Path(checkpoint_path)
+    gaussians = GaussianModel(sh_degree)
+    gaussians.load_ply(str(checkpoint_path))
+
+    xyz = gaussians._xyz.detach().cpu().numpy()
+    opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
+    scales = gaussians.get_scaling.detach().cpu().numpy()
+
+    # compute_prune_mask returns True=keep; GaussianModel.prune_points
+    # expects True=prune (it internally does valid_points_mask = ~mask) --
+    # invert here, once, so callers of prune_checkpoint never need to know
+    # about this polarity difference.
+    keep_mask = compute_prune_mask(xyz, opacity, scales, bbox_min, bbox_max)
+    gaussians.prune_points(torch.from_numpy(~keep_mask).to(gaussians._xyz.device))
+
+    output_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_pruned.ply")
+    gaussians.save_ply(str(output_path))
+    return output_path
+```
+
+- [ ] **Step 2: Manual verification on Colab (required, not optional)**
+
+Run `prune_checkpoint` on a real `final_train` checkpoint from Task 13 Step 6's verification run.
+Confirm `count_gaussians_in_ply(output_path) < count_gaussians_in_ply(checkpoint_path)` (the real
+`chair`/HCM scenes have sky/background floaters per the diagnosis in Task 12, so some pruning is
+expected), and that `real_render_fn` loads and renders the pruned `.ply` without error.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/postprocess/prune_floaters.py
+git commit -m "Add checkpoint-level floater prune wrapper (load/prune/save .ply)"
+```
+
+---
+
+### Task 15: Experiment-matrix orchestrator
 
 **Files:**
 - Create: `src/orchestrator/run_experiment_matrix.py`
 - Test: `tests/test_run_experiment_matrix.py`
 
 **Interfaces:**
-- Consumes: `ALL_TRAINING_VARIANTS`, `run_training_variant` (Task 5's corrected version),
-  `select_best_candidate` (prerequisite Task 6), `estimate_vram_bytes`/`count_gaussians_in_ply`
-  (prerequisite Task 1), `needs_tiebreak_rerun` (Task 3), everything Plan 1's
-  `run_baseline_pipeline` already wires (holdout split, `undistort_scene`,
-  `build_filtered_scene`, `compute_pair_metrics`, `package_submission`, `validate_submission`).
+- Consumes: `ALL_TRAINING_VARIANTS`/`run_training_variant` (Task 13), `select_best_candidate`
+  (Task 6), `estimate_vram_bytes`/`count_gaussians_in_ply` (Task 1), `needs_tiebreak_rerun`
+  (Task 11), everything Plan 1's `run_baseline_pipeline` already wires (holdout split,
+  `undistort_scene`, `build_filtered_scene`, `compute_pair_metrics`, `package_submission`,
+  `validate_submission`).
 - Produces: `run_experiment_matrix_pipeline(scenes, screening_train_fn, final_train_fn, render_fn, prune_fn, lpips_model, psnr_max, vram_budget_bytes, output_root, extra_candidates_by_scene=None, tiebreak_threshold=0.01) -> ExperimentPipelineResult`
   — `screening_train_fn(scene, variant, output_dir) -> Path` and
   `final_train_fn(scene, variant, output_dir, hyperparam_overrides=None) -> Path` are injected
   exactly like Plan 1's `train_fn`/`render_fn`, so this stays GPU-free and network-free to test.
-  `ExperimentPipelineResult` extends Plan 1's `PipelineResult` shape with
-  `chosen_config: dict[str, dict]` and `all_candidates: dict[str, list[dict]]`.
+  `ExperimentPipelineResult` carries `per_scene_scores`, `skipped_scenes`,
+  `chosen_config: dict[str, dict]`, `all_candidates: dict[str, list[dict]]`,
+  `validation_problems`, `submission_zip`.
 
-**This supersedes Task 9 of `docs/superpowers/plans/2026-07-18-advanced-techniques.md` — do not
-implement that version.** Three differences, all needed for the 7-day plan (spec section 3-6):
-1. `screening_train_fn`/`final_train_fn` split (reduced-iteration screening vs. full-iteration
-   final retrain — spec section 5).
-2. Scenes are undistorted (`undistort_scene`) before any training — the original Task 9 omitted
-   this and would crash on the 5 real BTS scenes (`SIMPLE_RADIAL` cameras raise inside the
-   vendored loader).
+Three design points worth calling out (spec sections 3-6):
+1. `screening_train_fn`/`final_train_fn` split — reduced-iteration screening vs. full-iteration
+   final retrain.
+2. Scenes are undistorted (`undistort_scene`) before any training — real BTS scenes are
+   `SIMPLE_RADIAL` and would crash the vendored loader otherwise.
 3. `extra_candidates_by_scene` and `tiebreak_threshold`/`needs_tiebreak_rerun` wiring for Giai
-   đoạn 2's bounded hyperparameter search (spec section 6) and the screening tie-break rule
-   (spec section 5).
+   đoạn 2's bounded hyperparameter search and the screening tie-break rule.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -608,10 +1697,6 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     def fake_render_fn(checkpoint, params_list, output_dir):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        # Deterministic per-checkpoint pixel fill so different checkpoints
-        # score differently against the real chair GT images (avoids every
-        # candidate tying exactly, which would make the tie-break path
-        # untestable).
         fill = hash(str(checkpoint)) % 200
         written = []
         for params in params_list:
@@ -647,16 +1732,11 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
         extra_candidates_by_scene=extra_candidates,
     )
 
-    # All 5 named variants were screened via the reduced-iteration path.
     assert set(screening_calls) == {
         "baseline", "depth_reg", "anti_alias", "appearance_embed", "full_stack",
     }
-    # 10 variant x floater candidates + 2 extra chair candidates.
     assert len(result.all_candidates["chair"]) == 12
     assert any(c.get("candidate_name") == "chair_extra_0" for c in result.all_candidates["chair"])
-
-    # The winner was retrained at full iterations via final_train_fn, into a
-    # "final_train" output dir -- never shipped straight from screening.
     assert any("final_train" in call[1] for call in final_calls)
 
     assert "chair" in result.chosen_config
@@ -896,7 +1976,7 @@ Expected: `PASS` (1 passed).
 
 ```bash
 git add src/orchestrator/run_experiment_matrix.py tests/test_run_experiment_matrix.py
-git commit -m "Add corrected experiment-matrix orchestrator (screening/final split, undistort fix, bounded search)"
+git commit -m "Add experiment-matrix orchestrator (screening/final split, undistort, bounded search)"
 ```
 
 - [ ] **Step 6: Manual verification on Colab (required, not optional)**
@@ -905,97 +1985,27 @@ Run `run_experiment_matrix_pipeline` for `chair` alone first (cheapest scene) wi
 `screening_train_fn = functools.partial(run_training_variant, iterations=15000)` and
 `final_train_fn = functools.partial(run_training_variant, iterations=30000)`, no extra
 candidates. Confirm: all 5 variants train, `chosen_config["chair"]` is populated, `test_render/`
-has real images, `submission_zip` validates clean. Only then move to Task 7's full notebook
+has real images, `submission_zip` validates clean. Only then move to Task 16's full notebook
 wiring for all 7 scenes.
 
 ---
 
-### Task 7: Checkpoint-level floater prune wrapper
-
-**Files:**
-- Modify: `src/postprocess/prune_floaters.py` (created by prerequisite Task 2 of
-  `docs/superpowers/plans/2026-07-18-advanced-techniques.md` — that task only produces
-  `compute_prune_mask`, a boolean array function; it does not wrap file I/O)
-
-**Interfaces:**
-- Consumes: `compute_prune_mask(xyz, opacity, scales, bbox_min, bbox_max) -> np.ndarray`
-  (prerequisite Task 2).
-- Produces: `prune_checkpoint(checkpoint_path: Path, bbox_min: np.ndarray, bbox_max: np.ndarray, sh_degree: int = 3) -> Path`
-  — loads the `.ply` at `checkpoint_path` via the vendored `GaussianModel.load_ply`, prunes
-  floaters via `compute_prune_mask`, saves the result as `<stem>_pruned.ply` next to the
-  original, and returns that path. This is the exact `prune_fn` callable Task 6's
-  `run_experiment_matrix_pipeline` (and Task 8's notebook cells) inject.
-
-This wraps the vendored `GaussianModel.load_ply`/`.prune_points`/`.save_ply` (verified present in
-the checked-out `third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), which
-hardcode `device="cuda"` internally — same GPU-dependent category as `run_training_variant`, so
-there is no local `pytest` step; `compute_prune_mask` itself (prerequisite Task 2) already has
-its own local tests.
-
-- [ ] **Step 1: Append to `src/postprocess/prune_floaters.py`**
-
-```python
-def prune_checkpoint(checkpoint_path, bbox_min, bbox_max, sh_degree: int = 3):
-    from pathlib import Path
-
-    import torch
-
-    from scene import GaussianModel
-
-    checkpoint_path = Path(checkpoint_path)
-    gaussians = GaussianModel(sh_degree)
-    gaussians.load_ply(str(checkpoint_path))
-
-    xyz = gaussians._xyz.detach().cpu().numpy()
-    opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
-    scales = gaussians.get_scaling.detach().cpu().numpy()
-
-    # compute_prune_mask returns True=keep; GaussianModel.prune_points
-    # expects True=prune (it internally does valid_points_mask = ~mask) --
-    # invert here, once, so callers of prune_checkpoint never need to know
-    # about this polarity difference.
-    keep_mask = compute_prune_mask(xyz, opacity, scales, bbox_min, bbox_max)
-    gaussians.prune_points(torch.from_numpy(~keep_mask).to(gaussians._xyz.device))
-
-    output_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_pruned.ply")
-    gaussians.save_ply(str(output_path))
-    return output_path
-```
-
-- [ ] **Step 2: Manual verification on Colab (required, not optional)**
-
-Run `prune_checkpoint` on a real `final_train` checkpoint from Task 6 Step 6's verification run.
-Confirm `count_gaussians_in_ply(output_path) < count_gaussians_in_ply(checkpoint_path)` (the real
-`chair`/HCM scenes have sky/background floaters per the diagnosis in Task 4, so some pruning is
-expected), and that `real_render_fn` loads and renders the pruned `.ply` without error, same as
-any other checkpoint.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/postprocess/prune_floaters.py
-git commit -m "Add checkpoint-level floater prune wrapper (load/prune/save .ply)"
-```
-
----
-
-### Task 8: Wire Giai đoạn 1+2 into the Colab notebooks
+### Task 16: Wire Giai đoạn 1+2 into the Colab notebooks
 
 **Files:**
 - Modify: `notebooks/colab_runner_hcm.ipynb` (5 HCM scenes — Giai đoạn 1 only, no extras)
 - Modify: `notebooks/colab_runner_bonsai.ipynb` (`bonsai` + `chair` — Giai đoạn 1 + Giai đoạn 2)
 
 **Interfaces:**
-- Consumes: `run_experiment_matrix_pipeline` (Task 6), `build_hyperparam_candidates` (Task 3),
-  `write_reproducibility_bundle` (prerequisite Task 10).
+- Consumes: `run_experiment_matrix_pipeline` (Task 15), `build_hyperparam_candidates` (Task 11),
+  `write_reproducibility_bundle` (Task 8), `prune_checkpoint` (Task 14).
 
 Each scene is run through its own call to `run_experiment_matrix_pipeline` (`scenes=[scene]`),
 not one call for all scenes at once — a Colab disconnect partway through then loses at most one
-scene's progress, not all of them, matching the resumability property Plan 1's notebooks already
-rely on.
+scene's progress, not all of them.
 
-- [ ] **Step 1: Add a new Bước 9 cell to `notebooks/colab_runner_hcm.ipynb` (after the new Bước 8
-  diagnosis cell from Task 4)**
+- [ ] **Step 1: Add a new Bước 9 cell to `notebooks/colab_runner_hcm.ipynb` (after the Bước 8
+  diagnosis cell from Task 12)**
 
 Markdown cell:
 
@@ -1012,7 +2022,6 @@ Code cell:
 ```python
 import functools
 
-from src.evaluation.screening import needs_tiebreak_rerun
 from src.orchestrator.run_experiment_matrix import run_experiment_matrix_pipeline
 from src.postprocess.prune_floaters import prune_checkpoint
 from src.submission.reproducibility_bundle import write_reproducibility_bundle
@@ -1135,16 +2144,15 @@ git commit -m "Wire Giai doan 1+2 experiment matrix into both Colab notebooks"
 
 ---
 
-### Task 9: Final merge and reproducibility bundle close-out (Giai đoạn 3)
+### Task 17: Final merge and reproducibility bundle close-out (Giai đoạn 3)
 
 **Files:**
 - Modify: `notebooks/colab_runner_hcm.ipynb`
 
 **Interfaces:**
-- Consumes: the existing Bước 8 merge cell (already present, see
-  `docs/superpowers/specs/2026-07-23-score-push-design.md` section 3 — it already scans
-  `OUTPUT_ROOT/<scene>/test_render/` for all 7 scenes, which is exactly where Task 6's
-  `run_experiment_matrix_pipeline` writes its final render). No change needed to that cell logic.
+- Consumes: the existing Bước 8 (7-scene) merge cell — already present, already scans
+  `OUTPUT_ROOT/<scene>/test_render/` for all 7 scenes, which is exactly where Task 15's
+  `run_experiment_matrix_pipeline` writes its final render. No change needed to that cell logic.
   This task only adds packaging the reproducibility bundle **separately** from
   `submission.zip` — the exam's submission format (spec 1.5) allows only rendered images inside
   it.
@@ -1176,7 +2184,7 @@ else:
 
 - [ ] **Step 2: Manual verification on Colab (required)**
 
-After all 7 scenes have gone through Task 8's Bước 9 in their respective notebooks, run the
+After all 7 scenes have gone through Task 16's Bước 9 in their respective notebooks, run the
 existing Bước 8 merge cell, then this new Bước 10 cell. Confirm `submission.zip` validates clean
 (existing `validate_submission` check in Bước 8) and `reproducibility_bundle.zip` contains a
 subfolder per scene with `chosen_config.yaml` and `all_candidates_scores.csv`.
@@ -1192,27 +2200,29 @@ git commit -m "Add reproducibility bundle packaging, kept separate from submissi
 
 ## Self-Review Summary
 
-- **Spec coverage:** Giai đoạn 0 (diagnosis) → Task 1/2/4. Giai đoạn 1 (5-variant matrix,
-  reduced-iteration screening, tie-break) → Task 3/5/6/7/8. Giai đoạn 2 (bounded hyperparameter
-  search for bonsai/chair) → Task 3/6/7/8. Giai đoạn 3 (final retrain, blind render,
-  reproducibility bundle, merge) → Task 6 (retrain+render+package are inside the orchestrator
-  itself) + Task 9 (reproducibility close-out). Out-of-scope items from the spec (full grid
-  across all 7 scenes, A100, parallel sessions) are not implemented anywhere in this plan,
-  consistent with the spec.
+- **Spec coverage:** advanced-techniques building blocks → Task 1-8 (carried over from
+  `docs/superpowers/plans/2026-07-18-advanced-techniques.md`, its own Task 11 already done and
+  not repeated). Giai đoạn 0 (diagnosis) → Task 9/10/12. Giai đoạn 1 (5-variant matrix,
+  reduced-iteration screening, tie-break) → Task 11/13/14/15/16. Giai đoạn 2 (bounded
+  hyperparameter search for bonsai/chair) → Task 11/15/16. Giai đoạn 3 (final retrain, blind
+  render, reproducibility bundle, merge) → Task 15 (retrain+render+package are inside the
+  orchestrator itself) + Task 17 (reproducibility close-out). Out-of-scope items from the spec
+  (full grid across all 7 scenes, A100, parallel sessions) are not implemented anywhere in this
+  plan.
 - **Placeholder scan:** no TBD/TODO; every code step has complete, runnable code; no "similar to
-  Task N" shortcuts. Task 7 was added during self-review — the original draft referenced a
-  `prune_floaters`/`prune_fn` callable operating directly on checkpoint paths, but the
-  prerequisite plan's Task 2 only produces `compute_prune_mask` (a boolean-array function over
-  already-loaded Gaussian attributes, not file I/O) — Task 7 closes that gap with a real
-  `prune_checkpoint(checkpoint_path, bbox_min, bbox_max) -> Path` wrapper, verified against the
-  vendored `GaussianModel.load_ply`/`prune_points`/`save_ply` methods in the actual checked-out
-  submodule (`third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), including the
+  Task N" shortcuts. Task 14 closes a real gap discovered while first drafting this plan: the
+  original advanced-techniques document's Task 2 only produces `compute_prune_mask` (a
+  boolean-array function over already-loaded Gaussian attributes, not file I/O) — nothing in that
+  document ever wraps it into a `checkpoint_path -> checkpoint_path` callable, which Task 15's
+  `prune_fn` parameter requires. Task 14 closes that gap, verified against the vendored
+  `GaussianModel.load_ply`/`prune_points`/`save_ply` methods in the actual checked-out submodule
+  (`third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), including the
   keep/prune mask polarity inversion `prune_points` requires.
-- **Type consistency:** `run_training_variant`'s new `hyperparam_overrides` parameter (Task 5) is
-  used consistently with the same name/shape (`dict[str, object] | None`) in Task 6's
-  `final_train_fn` calls and Task 8's notebook cells. `ExperimentPipelineResult.chosen_config`
-  entries carry an optional `hyperparam_overrides` key (only present for Giai đoạn 2 candidates)
-  — Task 6's final-retrain call uses `.get("hyperparam_overrides")`, which is `None` for the
-  10 base variant/floater candidates and the dict for extras, matching Task 5's default.
-  `prune_fn` is now consistently `prune_checkpoint` (Task 7) everywhere it's referenced: Task 6's
-  test/interface, and both notebook cells in Task 8.
+- **Type consistency:** `run_training_variant`'s `hyperparam_overrides` parameter (Task 13,
+  included from the first draft rather than bolted on later) is used consistently with the same
+  name/shape (`dict[str, object] | None`) in Task 15's `final_train_fn` calls and Task 16's
+  notebook cells. `ExperimentPipelineResult.chosen_config` entries carry an optional
+  `hyperparam_overrides` key (only present for Giai đoạn 2 candidates) — Task 15's final-retrain
+  call uses `.get("hyperparam_overrides")`, `None` for the 10 base variant/floater candidates,
+  the dict for extras. `prune_fn` is consistently `prune_checkpoint` (Task 14) everywhere it's
+  referenced: Task 15's test/interface, and both notebook cells in Task 16.
