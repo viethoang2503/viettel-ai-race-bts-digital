@@ -782,7 +782,12 @@ training render loop AND every later render of that checkpoint (holdout eval and
   — writes `output_dir/<scene_name>/chosen_config.yaml`,
   `output_dir/<scene_name>/all_candidates_scores.csv`, returns `output_dir/<scene_name>`. Per
   exam spec 1.7, this is what gets handed to the organizers if requested — config + full score
-  comparison table, so the choice of variant per scene is traceable and justified.
+  comparison table, so the choice of variant per scene is traceable and justified. The CSV
+  includes `candidate_name`, `hyperparam_overrides` (JSON-encoded), and `fallback_reason` columns
+  — Giai đoạn 2's bounded-search candidates (Task 11's `build_hyperparam_candidates`) and
+  `select_best_candidate`'s VRAM-fallback path (Task 6) both set these keys, and a bundle that
+  silently dropped them would defeat its own purpose: nobody could tell WHICH hyperparameter
+  override actually won for `bonsai`/`chair`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -822,6 +827,29 @@ def test_write_reproducibility_bundle_creates_config_and_scores_csv(tmp_path):
         rows = list(csv.DictReader(f))
     assert len(rows) == 2
     assert {row["variant"] for row in rows} == {"full_stack", "baseline"}
+
+
+def test_write_reproducibility_bundle_preserves_giai_doan_2_and_fallback_fields(tmp_path):
+    chosen_config = {
+        "variant": "baseline", "floater_cleanup": False, "score": 0.60,
+        "estimated_vram_bytes": 999_999_999_999, "checkpoint_path": "b.ply",
+        "fallback_reason": "no candidate fit the VRAM budget",
+    }
+    all_candidates = [
+        chosen_config,
+        {"variant": "baseline", "floater_cleanup": False, "candidate_name": "bonsai_0",
+         "score": 0.75, "estimated_vram_bytes": 999_999_999_999, "checkpoint_path": "e0.ply",
+         "hyperparam_overrides": {"densify_grad_threshold": 0.0005}},
+    ]
+
+    bundle_dir = write_reproducibility_bundle("bonsai", chosen_config, all_candidates, tmp_path)
+
+    with open(bundle_dir / "all_candidates_scores.csv", newline="") as f:
+        rows = {row["candidate_name"] or row["checkpoint_path"]: row for row in csv.DictReader(f)}
+
+    assert rows["b.ply"]["fallback_reason"] == "no candidate fit the VRAM budget"
+    assert rows["bonsai_0"]["candidate_name"] == "bonsai_0"
+    assert "0.0005" in rows["bonsai_0"]["hyperparam_overrides"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -835,6 +863,7 @@ Expected: `FAIL` — `ModuleNotFoundError: No module named 'src.submission.repro
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import yaml
@@ -849,12 +878,18 @@ def write_reproducibility_bundle(
     with open(bundle_dir / "chosen_config.yaml", "w") as f:
         yaml.safe_dump(chosen_config, f)
 
-    fieldnames = ["variant", "floater_cleanup", "score", "estimated_vram_bytes", "checkpoint_path"]
+    fieldnames = [
+        "variant", "floater_cleanup", "candidate_name", "score", "estimated_vram_bytes",
+        "checkpoint_path", "hyperparam_overrides", "fallback_reason",
+    ]
     with open(bundle_dir / "all_candidates_scores.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for candidate in sorted(all_candidates, key=lambda c: -c["score"]):
-            writer.writerow({k: candidate.get(k) for k in fieldnames})
+            row = {k: candidate.get(k) for k in fieldnames}
+            if row["hyperparam_overrides"] is not None:
+                row["hyperparam_overrides"] = json.dumps(row["hyperparam_overrides"])
+            writer.writerow(row)
 
     return bundle_dir
 ```
@@ -862,7 +897,7 @@ def write_reproducibility_bundle(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_reproducibility_bundle.py -v`
-Expected: `PASS` (1 passed).
+Expected: `PASS` (2 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -1076,6 +1111,13 @@ git commit -m "Add worst-first holdout ranking for scene diagnosis"
   - `needs_tiebreak_rerun(candidates: list[dict], threshold: float = 0.01) -> list[str]` — given
     dicts with `"variant"` and `"score"` keys, returns the `variant` names (excluding the single
     highest scorer) whose score is within `threshold` of the leader.
+  - `variants_needing_full_iteration_verification(candidates: list[dict], threshold: float = 0.01) -> list[str]`
+    — wraps `needs_tiebreak_rerun`, but when it returns any runner-up, the LEADER is included too
+    (leader first, then runner-ups, no duplicates). A reduced-iteration screening leader is not a
+    trustworthy baseline to compare a full-iteration runner-up against — re-verifying only the
+    runner-up would unfairly let it win purely from getting more training, not from actually
+    being better. Returns `[]` when there is no close call (nothing needs re-verification,
+    including the leader).
   - `build_hyperparam_candidates(base_overrides: dict[str, object], extra_overrides: list[dict[str, object]], label_prefix: str) -> list[dict[str, object]]`
     — for each entry in `extra_overrides`, merges it on top of `base_overrides` and tags the
     result with a unique `candidate_name` (`f"{label_prefix}_{i}"`). Deliberately NOT a
@@ -1085,7 +1127,11 @@ git commit -m "Add worst-first holdout ranking for scene diagnosis"
 
 ```python
 # tests/test_screening.py
-from src.evaluation.screening import build_hyperparam_candidates, needs_tiebreak_rerun
+from src.evaluation.screening import (
+    build_hyperparam_candidates,
+    needs_tiebreak_rerun,
+    variants_needing_full_iteration_verification,
+)
 
 
 def test_needs_tiebreak_rerun_flags_close_runner_up():
@@ -1107,6 +1153,31 @@ def test_needs_tiebreak_rerun_returns_empty_when_leader_is_clear():
 
 def test_needs_tiebreak_rerun_handles_empty_list():
     assert needs_tiebreak_rerun([], threshold=0.01) == []
+
+
+def test_variants_needing_full_iteration_verification_includes_leader_with_close_runner_up():
+    candidates = [
+        {"variant": "full_stack", "score": 0.700},
+        {"variant": "depth_reg", "score": 0.695},
+        {"variant": "baseline", "score": 0.500},
+    ]
+    result = variants_needing_full_iteration_verification(candidates, threshold=0.01)
+    # Leader must be re-verified too -- comparing a full-iteration
+    # runner-up against the leader's un-verified screening score would be
+    # an unfair fight.
+    assert result == ["full_stack", "depth_reg"]
+
+
+def test_variants_needing_full_iteration_verification_empty_when_leader_is_clear():
+    candidates = [
+        {"variant": "full_stack", "score": 0.700},
+        {"variant": "baseline", "score": 0.500},
+    ]
+    assert variants_needing_full_iteration_verification(candidates, threshold=0.01) == []
+
+
+def test_variants_needing_full_iteration_verification_handles_empty_list():
+    assert variants_needing_full_iteration_verification([], threshold=0.01) == []
 
 
 def test_build_hyperparam_candidates_merges_and_labels():
@@ -1147,6 +1218,14 @@ def needs_tiebreak_rerun(candidates: list[dict], threshold: float = 0.01) -> lis
     return [c["variant"] for c in ranked[1:] if leader_score - c["score"] <= threshold]
 
 
+def variants_needing_full_iteration_verification(candidates: list[dict], threshold: float = 0.01) -> list[str]:
+    runner_ups = needs_tiebreak_rerun(candidates, threshold=threshold)
+    if not runner_ups:
+        return []
+    leader = max(candidates, key=lambda c: c["score"])["variant"]
+    return list(dict.fromkeys([leader, *runner_ups]))
+
+
 def build_hyperparam_candidates(
     base_overrides: dict[str, object], extra_overrides: list[dict[str, object]], label_prefix: str,
 ) -> list[dict[str, object]]:
@@ -1161,13 +1240,13 @@ def build_hyperparam_candidates(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_screening.py -v`
-Expected: `PASS` (5 passed).
+Expected: `PASS` (8 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/evaluation/screening.py tests/test_screening.py
-git commit -m "Add screening tie-break decision and bounded hyperparameter candidate builder"
+git commit -m "Add screening tie-break decision, leader re-verification, and hyperparameter candidate builder"
 ```
 
 ---
@@ -1248,7 +1327,7 @@ Run this cell after Bước 7 with Drive mounted (Bước 2) and the environment
 each of the 7 scenes, confirm: predicted/ground-truth pairs display side by side, LPIPS/SSIM/PSNR
 values are printed, and no exception is raised for scenes whose `holdout_render/` already exists
 from the finished Plan 1 run. Note down, per scene (especially `bonsai`/`chair`), what the worst
-frames have in common — this human judgment feeds Task 16's `extra_overrides` choice for Giai
+frames have in common — this human judgment feeds Task 17's `extra_overrides` choice for Giai
 đoạn 2.
 
 - [ ] **Step 3: Commit**
@@ -1283,6 +1362,10 @@ checked-out `third_party/gaussian-splatting/train.py` before trusting it.
     — GPU-dependent; runs the actual training loop and returns the final checkpoint `.ply` path.
     Unknown override keys raise `ValueError` immediately rather than silently doing nothing — a
     typo would otherwise waste a full Colab run before anyone notices the override never applied.
+    `hyperparam_overrides["iterations"]`, if present, actually controls the loop length, the save
+    call, and the returned checkpoint path (via `effective_iterations`) — it is NOT just an
+    `opt.iterations = ...` `setattr` like every other override key, since the training loop's
+    `range()` bound is the function parameter `iterations`, not `opt.iterations`.
 
 - [ ] **Step 1: Write the failing test (variant config only, no GPU)**
 
@@ -1411,9 +1494,18 @@ def run_training_variant(
     dataset, pipe, opt = _build_dataset_args(
         scene.gs_source_dir, output_dir, variant.use_anti_alias,
     )
-    opt.iterations = iterations
 
-    for key, value in (hyperparam_overrides or {}).items():
+    # "iterations" is handled separately from the rest of hyperparam_overrides:
+    # everything else is a plain opt.<key> = value, but the actual loop bound
+    # below is driven by the *function parameter* iterations, not opt.iterations
+    # -- setattr(opt, "iterations", ...) alone would silently leave the loop,
+    # the final gs_scene.save() call, and the returned checkpoint path all
+    # still using the un-overridden iteration count.
+    overrides = dict(hyperparam_overrides or {})
+    effective_iterations = overrides.pop("iterations", iterations)
+    opt.iterations = effective_iterations
+
+    for key, value in overrides.items():
         if not hasattr(opt, key):
             raise ValueError(f"unknown training hyperparameter override: {key!r}")
         setattr(opt, key, value)
@@ -1434,7 +1526,7 @@ def run_training_variant(
 
     bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
-    for iteration in range(1, iterations + 1):
+    for iteration in range(1, effective_iterations + 1):
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -1490,8 +1582,8 @@ def run_training_variant(
     if appearance is not None:
         _save_mean_appearance(appearance, output_dir)
 
-    gs_scene.save(iterations)
-    final_ply = output_dir / "point_cloud" / f"iteration_{iterations}" / "point_cloud.ply"
+    gs_scene.save(effective_iterations)
+    final_ply = output_dir / "point_cloud" / f"iteration_{effective_iterations}" / "point_cloud.ply"
     return final_ply
 
 
@@ -1534,6 +1626,10 @@ Run in this order and fix any remaining mismatch before trusting it:
    run on `baseline`/`chair` — print `opt.densify_grad_threshold` right after the override loop
    to confirm it actually changed from the vendored default (`0.0002`). Confirm
    `hyperparam_overrides={"not_a_real_field": 1}` raises `ValueError` immediately.
+5. `run_training_variant(chair_scene, baseline_variant, some_dir, iterations=200, hyperparam_overrides={"iterations": 50})`
+   — confirm training actually stops at iteration 50 (not 200), and the returned path contains
+   `iteration_50`, not `iteration_200`. This is the exact bug Task 16's Giai đoạn 2
+   `{"iterations": 45000}` candidates depend on being fixed.
 
 Known things most likely to still need adjustment on real hardware: whether `Scene.save` writes
 exactly to `point_cloud/iteration_<N>/point_cloud.ply` for this submodule pin, and whether
@@ -1553,13 +1649,22 @@ exactly to `point_cloud/iteration_<N>/point_cloud.ply` for this submodule pin, a
 - Produces: `prune_checkpoint(checkpoint_path: Path, bbox_min: np.ndarray, bbox_max: np.ndarray, sh_degree: int = 3) -> Path`
   — loads the `.ply` at `checkpoint_path` via the vendored `GaussianModel.load_ply`, prunes
   floaters via `compute_prune_mask`, saves the result as `<stem>_pruned.ply` next to the
-  original, and returns that path. This is the exact `prune_fn` callable Task 15's
-  `run_experiment_matrix_pipeline` (and Task 16's notebook cells) inject.
+  original, and returns that path. This is the exact `prune_fn` callable Task 16's
+  `run_experiment_matrix_pipeline` (and Task 17's notebook cells) inject.
 
-This wraps the vendored `GaussianModel.load_ply`/`.prune_points`/`.save_ply` (verified present in
-the checked-out `third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), which
-hardcode `device="cuda"` internally — same GPU-dependent category as Task 13, so there is no
-local `pytest` step; `compute_prune_mask` itself (Task 2) already has its own local tests.
+This wraps the vendored `GaussianModel.load_ply`/`.save_ply` (verified present in the checked-out
+`third_party/gaussian-splatting/scene/gaussian_model.py:239,263`), which hardcode `device="cuda"`
+internally — same GPU-dependent category as Task 13, so there is no local `pytest` step;
+`compute_prune_mask` itself (Task 2) already has its own local tests.
+
+**Does NOT use `GaussianModel.prune_points()`.** That method (verified at
+`third_party/gaussian-splatting/scene/gaussian_model.py:331,349`) goes through
+`_prune_optimizer`, which dereferences `self.optimizer.param_groups` — but `self.optimizer` is
+only ever created by `training_setup()`, which a render/prune-only `load_ply()` never calls, so
+`self.optimizer` is `None` and this would crash with `AttributeError: 'NoneType' object has no
+attribute 'param_groups'`. Instead, `prune_checkpoint` filters the six raw parameter tensors
+`save_ply` reads (`_xyz`, `_features_dc`, `_features_rest`, `_opacity`, `_scaling`, `_rotation`)
+directly, with no optimizer involved at all.
 
 - [ ] **Step 1: Append to `src/postprocess/prune_floaters.py`**
 
@@ -1568,6 +1673,7 @@ def prune_checkpoint(checkpoint_path, bbox_min, bbox_max, sh_degree: int = 3):
     from pathlib import Path
 
     import torch
+    import torch.nn as nn
 
     from scene import GaussianModel
 
@@ -1579,12 +1685,19 @@ def prune_checkpoint(checkpoint_path, bbox_min, bbox_max, sh_degree: int = 3):
     opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
     scales = gaussians.get_scaling.detach().cpu().numpy()
 
-    # compute_prune_mask returns True=keep; GaussianModel.prune_points
-    # expects True=prune (it internally does valid_points_mask = ~mask) --
-    # invert here, once, so callers of prune_checkpoint never need to know
-    # about this polarity difference.
     keep_mask = compute_prune_mask(xyz, opacity, scales, bbox_min, bbox_max)
-    gaussians.prune_points(torch.from_numpy(~keep_mask).to(gaussians._xyz.device))
+    keep_mask_t = torch.from_numpy(keep_mask).to(gaussians._xyz.device)
+
+    # Deliberately NOT GaussianModel.prune_points(): that method routes
+    # through _prune_optimizer, which needs self.optimizer -- only set by
+    # training_setup(), which a load-prune-save-only path never calls.
+    # Filter the six tensors save_ply() actually reads directly instead.
+    gaussians._xyz = nn.Parameter(gaussians._xyz[keep_mask_t].detach())
+    gaussians._features_dc = nn.Parameter(gaussians._features_dc[keep_mask_t].detach())
+    gaussians._features_rest = nn.Parameter(gaussians._features_rest[keep_mask_t].detach())
+    gaussians._opacity = nn.Parameter(gaussians._opacity[keep_mask_t].detach())
+    gaussians._scaling = nn.Parameter(gaussians._scaling[keep_mask_t].detach())
+    gaussians._rotation = nn.Parameter(gaussians._rotation[keep_mask_t].detach())
 
     output_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_pruned.ply")
     gaussians.save_ply(str(output_path))
@@ -1594,7 +1707,9 @@ def prune_checkpoint(checkpoint_path, bbox_min, bbox_max, sh_degree: int = 3):
 - [ ] **Step 2: Manual verification on Colab (required, not optional)**
 
 Run `prune_checkpoint` on a real `final_train` checkpoint from Task 13 Step 6's verification run.
-Confirm `count_gaussians_in_ply(output_path) < count_gaussians_in_ply(checkpoint_path)` (the real
+Confirm it does NOT raise (in particular, does not hit the `self.optimizer is None` crash
+`prune_points()` would have caused),
+`count_gaussians_in_ply(output_path) < count_gaussians_in_ply(checkpoint_path)` (the real
 `chair`/HCM scenes have sky/background floaters per the diagnosis in Task 12, so some pruning is
 expected), and that `real_render_fn` loads and renders the pruned `.ply` without error.
 
@@ -1607,7 +1722,120 @@ git commit -m "Add checkpoint-level floater prune wrapper (load/prune/save .ply)
 
 ---
 
-### Task 15: Experiment-matrix orchestrator
+### Task 15: Variant-aware rendering (render_fn config)
+
+**Problem this closes:** `real_render_fn` (`src/rendering/gs_render_fn.py`, already implemented
+and in use since Plan 1) builds its `pipe`/appearance state from all-defaults
+(`_default_opt_and_pipe()`), with no way to turn `pipe.antialiasing` on or apply a saved
+appearance correction. Task 13's `anti_alias`/`full_stack` variants train with
+`pipe.antialiasing=True`, and `appearance_embed`/`full_stack` train a per-image color
+correction whose *mean* (`mean_appearance.pt`) is meant to stand in for novel views — but nothing
+in this plan actually applied either at render/evaluation time before this task. Every holdout
+score for those variants would silently be scored against a checkpoint rendered in a DIFFERENT
+configuration than it was trained in, defeating the entire point of comparing variants.
+
+**Files:**
+- Modify: `src/rendering/gs_render_fn.py`
+
+**Interfaces:**
+- Modifies: `real_render_fn(checkpoint, params_list, output_dir) -> list[Path]` gains a 4th
+  parameter, `render_config: dict | None = None`, with optional keys `"antialiasing": bool` and
+  `"appearance_path": Path | None`. Default `None` behaves exactly as before (no behavior change
+  for Plan 1's existing calls, which never pass this argument) — `pipe.antialiasing` stays
+  `False` and no appearance correction is applied.
+
+- [ ] **Step 1: Modify `src/rendering/gs_render_fn.py`**
+
+Change the `real_render_fn` signature from:
+
+```python
+def real_render_fn(
+    checkpoint: Path, params_list: list[CameraParams], output_dir: Path,
+) -> list[Path]:
+```
+
+to:
+
+```python
+def real_render_fn(
+    checkpoint: Path, params_list: list[CameraParams], output_dir: Path,
+    render_config: dict | None = None,
+) -> list[Path]:
+```
+
+Replace the body from `gaussians = _load_gaussians(checkpoint)` through the `return render_all(...)`
+call with:
+
+```python
+    from src.training.appearance_embedding import apply_appearance
+
+    gaussians = _load_gaussians(checkpoint)
+    _opt, pipe = _default_opt_and_pipe()
+    render_config = render_config or {}
+    pipe.antialiasing = render_config.get("antialiasing", False)
+
+    appearance_affine_bias = None
+    appearance_path = render_config.get("appearance_path")
+    if appearance_path is not None and Path(appearance_path).exists():
+        # weights_only=False: our own checkpoint (a plain dict of two
+        # tensors), produced by Task 13's _save_mean_appearance -- trusted,
+        # same reasoning as _load_gaussians' torch.load above.
+        saved = torch.load(appearance_path, weights_only=False)
+        appearance_affine_bias = (saved["affine"].cuda(), saved["bias"].cuda())
+
+    background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+
+    def _render_one(params: CameraParams, gaussians) -> np.ndarray:
+        camera = Camera(
+            resolution=(params.width, params.height),
+            colmap_id=0,
+            R=params.R,
+            T=params.T,
+            FoVx=params.fov_x,
+            FoVy=params.fov_y,
+            depth_params=None,
+            image=_placeholder_image(params.width, params.height),
+            invdepthmap=None,
+            image_name=params.image_name,
+            uid=0,
+        )
+        rendered = gs_render(camera, gaussians, pipe, background)["render"]
+        if appearance_affine_bias is not None:
+            affine, bias = appearance_affine_bias
+            rendered = apply_appearance(rendered, affine, bias)
+        return _tensor_to_uint8_image(rendered)
+
+    return render_all(
+        checkpoint, None, output_dir, _render_one,
+        params_list=params_list, gaussians=gaussians,
+    )
+```
+
+(`Path` and `torch` are already imported at module level; `gs_render`/`Camera` are already
+imported inside the function, unchanged.)
+
+- [ ] **Step 2: Manual verification on Colab (required, not optional)**
+
+Using a `chair` checkpoint trained with the `anti_alias` variant (Task 13 Step 6): render once
+with `render_config=None` and once with `render_config={"antialiasing": True}`, confirm the two
+outputs differ (antialiasing is actually toggling something). Using an `appearance_embed`
+checkpoint: confirm `render_config={"appearance_path": <output_dir>/"mean_appearance.pt"}`
+produces a visibly different (color-corrected) image than `render_config=None`, and that a
+`render_config` with a non-existent `appearance_path` behaves identically to `render_config=None`
+(no crash, silently skipped) — Task 16's screening loop passes an `appearance_path` unconditionally
+whenever `variant.use_appearance_embed` is true, even before the file may have been written by a
+still-running training call in a different code path, and this must not crash.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/rendering/gs_render_fn.py
+git commit -m "Add render_config (antialiasing, appearance) to real_render_fn"
+```
+
+---
+
+### Task 16: Experiment-matrix orchestrator
 
 **Files:**
 - Create: `src/orchestrator/run_experiment_matrix.py`
@@ -1615,10 +1843,11 @@ git commit -m "Add checkpoint-level floater prune wrapper (load/prune/save .ply)
 
 **Interfaces:**
 - Consumes: `ALL_TRAINING_VARIANTS`/`run_training_variant` (Task 13), `select_best_candidate`
-  (Task 6), `estimate_vram_bytes`/`count_gaussians_in_ply` (Task 1), `needs_tiebreak_rerun`
-  (Task 11), everything Plan 1's `run_baseline_pipeline` already wires (holdout split,
-  `undistort_scene`, `build_filtered_scene`, `compute_pair_metrics`, `package_submission`,
-  `validate_submission`).
+  (Task 6), `estimate_vram_bytes`/`count_gaussians_in_ply` (Task 1),
+  `variants_needing_full_iteration_verification` (Task 11), `camera_focal_lengths`
+  (`src/common/pose_utils.py`, Plan 1), everything Plan 1's `run_baseline_pipeline` already wires
+  (holdout split, `undistort_scene`, `build_filtered_scene`, `compute_pair_metrics`,
+  `package_submission`, `validate_submission`), Task 15's `render_fn(checkpoint, params, output_dir, render_config=None)`.
 - Produces: `run_experiment_matrix_pipeline(scenes, screening_train_fn, final_train_fn, render_fn, prune_fn, lpips_model, psnr_max, vram_budget_bytes, output_root, extra_candidates_by_scene=None, tiebreak_threshold=0.01) -> ExperimentPipelineResult`
   — `screening_train_fn(scene, variant, output_dir) -> Path` and
   `final_train_fn(scene, variant, output_dir, hyperparam_overrides=None) -> Path` are injected
@@ -1627,13 +1856,30 @@ git commit -m "Add checkpoint-level floater prune wrapper (load/prune/save .ply)
   `chosen_config: dict[str, dict]`, `all_candidates: dict[str, list[dict]]`,
   `validation_problems`, `submission_zip`.
 
-Three design points worth calling out (spec sections 3-6):
+Design points worth calling out (spec sections 3-6):
 1. `screening_train_fn`/`final_train_fn` split — reduced-iteration screening vs. full-iteration
    final retrain.
 2. Scenes are undistorted (`undistort_scene`) before any training — real BTS scenes are
    `SIMPLE_RADIAL` and would crash the vendored loader otherwise.
-3. `extra_candidates_by_scene` and `tiebreak_threshold`/`needs_tiebreak_rerun` wiring for Giai
-   đoạn 2's bounded hyperparameter search and the screening tie-break rule.
+3. `extra_candidates_by_scene` and `tiebreak_threshold`/`variants_needing_full_iteration_verification`
+   wiring for Giai đoạn 2's bounded hyperparameter search and the screening tie-break rule — the
+   current screening LEADER is re-verified at full iterations too whenever any runner-up is close
+   enough to challenge it, not just the runner-up, so the eventual comparison is always
+   full-iterations-vs-full-iterations, never full-vs-screening.
+4. Every render/score call passes a `render_config` built from the variant actually used
+   (`{"antialiasing": variant.use_anti_alias, "appearance_path": ...}`, via `_render_config_for`)
+   — a checkpoint trained with anti-aliasing or appearance embedding on must be rendered and
+   scored with the same setting on, both during screening/tie-break/extra-candidate scoring and
+   for the final `test_poses.csv` render, or the holdout score and the shipped renders would
+   reflect a different model than what was actually trained.
+5. Holdout camera focal lengths use `camera_focal_lengths(camera.model, camera.params)`, not
+   `camera.params[0]`/`params[1]` directly — for `SIMPLE_PINHOLE` (`chair`, `bonsai`),
+   `params[1]` is `cx`, not a second focal length; see `src/common/pose_utils.py:27`'s own
+   docstring for why this is a documented trap, not a hypothetical one.
+6. Fails closed exactly like Plan 1's `run_baseline_pipeline`
+   (`src/orchestrator/run_pipeline.py:169-188`): any skipped scene, or any `validate_submission`
+   problem, forces `submission_zip = None` — the zip stays on disk for debugging but is never
+   reported as valid, since the exam voids the entire score for a missing/malformed scene.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1677,6 +1923,7 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     scene = _chair_scene()
     screening_calls = []
     final_calls = []
+    render_calls = []
 
     def fake_screening_train_fn(scene_arg, variant, output_dir):
         screening_calls.append(variant.name)
@@ -1694,7 +1941,8 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
         _write_fake_ply(ply)
         return ply
 
-    def fake_render_fn(checkpoint, params_list, output_dir):
+    def fake_render_fn(checkpoint, params_list, output_dir, render_config=None):
+        render_calls.append((str(checkpoint), render_config))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         fill = hash(str(checkpoint)) % 200
@@ -1739,9 +1987,80 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     assert any(c.get("candidate_name") == "chair_extra_0" for c in result.all_candidates["chair"])
     assert any("final_train" in call[1] for call in final_calls)
 
+    # anti_alias/full_stack screening renders must have been asked to
+    # render WITH antialiasing on -- a checkpoint trained with it on must
+    # never be scored/shipped as if it were off.
+    anti_alias_render_configs = [
+        cfg for ckpt, cfg in render_calls if "eval_anti_alias" in ckpt
+    ]
+    assert anti_alias_render_configs
+    assert all(cfg is not None and cfg["antialiasing"] is True for cfg in anti_alias_render_configs)
+    baseline_render_configs = [
+        cfg for ckpt, cfg in render_calls if "eval_baseline" in ckpt
+    ]
+    assert all(cfg is not None and cfg["antialiasing"] is False for cfg in baseline_render_configs)
+
     assert "chair" in result.chosen_config
     assert result.submission_zip is not None
     assert result.submission_zip.exists()
+
+
+def test_run_experiment_matrix_fails_closed_when_a_scene_is_skipped(tmp_path):
+    from src.common.config import SceneConfig
+
+    good_scene = _chair_scene()
+    bad_scene = SceneConfig(
+        name="does_not_exist",
+        root=Path("VAI_NVS_DATA_ROUND2/does_not_exist"),
+        train_images_dir=Path("VAI_NVS_DATA_ROUND2/does_not_exist/train/images"),
+        sparse_dir=Path("VAI_NVS_DATA_ROUND2/does_not_exist/train/sparse/0"),
+        test_poses_csv=Path("VAI_NVS_DATA_ROUND2/does_not_exist/test/test_poses.csv"),
+        submission_dir="does_not_exist",
+    )
+
+    def fake_train_fn(scene_arg, variant, output_dir, hyperparam_overrides=None):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ply = output_dir / "point_cloud.ply"
+        _write_fake_ply(ply)
+        return ply
+
+    def fake_render_fn(checkpoint, params_list, output_dir, render_config=None):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        written = []
+        for params in params_list:
+            path = output_dir / params.image_name
+            Image.fromarray(
+                np.zeros((params.height, params.width, 3), dtype=np.uint8)
+            ).save(path)
+            written.append(path)
+        return written
+
+    def fake_prune_fn(checkpoint_path, bbox_min, bbox_max):
+        pruned = Path(checkpoint_path).with_name("point_cloud_pruned.ply")
+        pruned.write_bytes(Path(checkpoint_path).read_bytes())
+        return pruned
+
+    # bad_scene is skipped by validate_scene (no data at that path), but
+    # good_scene (chair, real local data) is still fully trained -- a
+    # skipped scene must not silently stop OTHER scenes' progress, only
+    # the final submission_zip.
+    result = run_experiment_matrix_pipeline(
+        scenes=[good_scene, bad_scene],
+        screening_train_fn=fake_train_fn,
+        final_train_fn=fake_train_fn,
+        render_fn=fake_render_fn,
+        prune_fn=fake_prune_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        vram_budget_bytes=16 * 1024**3,
+        output_root=tmp_path,
+    )
+
+    assert "does_not_exist" in result.skipped_scenes
+    assert "chair" in result.chosen_config  # chair's own work was not wasted
+    assert result.submission_zip is None  # but the exam voids a missing-scene submission
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1762,11 +2081,11 @@ from PIL import Image
 
 from src.common.colmap_io import compute_scene_bbox, load_sparse_scene
 from src.common.config import SceneConfig
-from src.common.pose_utils import camera_extrinsics_from_colmap, focal2fov, qvec2rotmat
+from src.common.pose_utils import camera_extrinsics_from_colmap, camera_focal_lengths, focal2fov, qvec2rotmat
 from src.data_validation.validate_scene import validate_scene
 from src.evaluation.compute_metrics import combine_score, compute_pair_metrics
 from src.evaluation.make_holdout_split import select_holdout_images
-from src.evaluation.screening import needs_tiebreak_rerun
+from src.evaluation.screening import variants_needing_full_iteration_verification
 from src.evaluation.select_best_config import select_best_candidate
 from src.postprocess.vram_guard import count_gaussians_in_ply, estimate_vram_bytes
 from src.rendering.render_from_csv import CameraParams, load_test_poses_csv
@@ -1794,7 +2113,11 @@ def _camera_params_for_holdout(sparse, holdout_names, image_dims) -> list[Camera
         if img.name not in holdout_names:
             continue
         camera = sparse.cameras[img.camera_id]
-        fx, fy = camera.params[0], camera.params[1]
+        # NOT camera.params[0], camera.params[1] directly -- for
+        # SIMPLE_PINHOLE (chair, bonsai) params[1] is cx, not a second
+        # focal length. camera_focal_lengths() handles both camera models
+        # this pipeline ever holds (see its docstring).
+        fx, fy = camera_focal_lengths(camera.model, camera.params)
         r, t = camera_extrinsics_from_colmap(*img.qvec, *img.tvec)
         params.append(CameraParams(
             image_name=img.name, R=r, T=t,
@@ -1804,8 +2127,27 @@ def _camera_params_for_holdout(sparse, holdout_names, image_dims) -> list[Camera
     return params
 
 
-def _score_checkpoint(checkpoint, holdout_params, render_fn, render_dir, gt_dir, lpips_model, psnr_max):
-    rendered_paths = render_fn(checkpoint, holdout_params, render_dir)
+def _render_config_for(variant, train_output_dir: Path) -> dict:
+    """A checkpoint trained with anti-aliasing/appearance-embedding on must
+    be rendered (holdout scoring AND the final test_poses.csv render) with
+    the same setting on -- see Task 15's real_render_fn(render_config=...).
+    train_output_dir is the SAME directory passed as output_dir to the
+    train_fn that produced this variant's checkpoint (not derived from the
+    checkpoint path itself, which after Task 14's floater pruning is a
+    sibling file, not train_output_dir -- but Task 13's
+    _save_mean_appearance always writes directly under train_output_dir
+    regardless of pruning, so this stays correct for pruned checkpoints
+    too).
+    """
+    appearance_path = Path(train_output_dir) / "mean_appearance.pt"
+    return {
+        "antialiasing": variant.use_anti_alias,
+        "appearance_path": appearance_path if variant.use_appearance_embed else None,
+    }
+
+
+def _score_checkpoint(checkpoint, holdout_params, render_fn, render_dir, gt_dir, lpips_model, psnr_max, render_config):
+    rendered_paths = render_fn(checkpoint, holdout_params, render_dir, render_config=render_config)
     scores = []
     for path, params in zip(rendered_paths, holdout_params):
         gt_path = gt_dir / params.image_name
@@ -1858,10 +2200,12 @@ def run_experiment_matrix_pipeline(
         holdout_params = _camera_params_for_holdout(sparse, holdout_names, image_dims)
 
         candidates = []
+        output_dir_by_variant: dict[str, Path] = {}
         for variant in ALL_TRAINING_VARIANTS:
-            eval_checkpoint = screening_train_fn(
-                filtered_scene, variant, scene_output / f"eval_{variant.name}",
-            )
+            train_output_dir = scene_output / f"eval_{variant.name}"
+            output_dir_by_variant[variant.name] = train_output_dir
+            eval_checkpoint = screening_train_fn(filtered_scene, variant, train_output_dir)
+            render_config = _render_config_for(variant, train_output_dir)
             for use_floater_cleanup in (False, True):
                 checkpoint = (
                     prune_fn(eval_checkpoint, bbox_min, bbox_max)
@@ -1870,7 +2214,7 @@ def run_experiment_matrix_pipeline(
                 score = _score_checkpoint(
                     checkpoint, holdout_params, render_fn,
                     scene_output / f"holdout_{variant.name}_{use_floater_cleanup}",
-                    working_scene.train_images_dir, lpips_model, psnr_max,
+                    working_scene.train_images_dir, lpips_model, psnr_max, render_config,
                 )
                 candidates.append({
                     "variant": variant.name, "floater_cleanup": use_floater_cleanup,
@@ -1879,22 +2223,26 @@ def run_experiment_matrix_pipeline(
                     "checkpoint_path": str(checkpoint),
                 })
 
-        # Tie-break: re-run any variant whose BEST (floater on or off)
-        # screening score is within tiebreak_threshold of the leader, at
-        # full iterations, before trusting the reduced-iteration ranking.
+        # Tie-break: whenever any variant's BEST (floater on or off)
+        # screening score is within tiebreak_threshold of the leader, the
+        # LEADER is re-run at full iterations too (not just the
+        # runner-up) -- comparing a full-iteration runner-up against the
+        # leader's un-verified screening score would unfairly let it win
+        # purely from getting more training. See Task 11's
+        # variants_needing_full_iteration_verification.
         best_per_variant = {}
         for c in candidates:
             if c["variant"] not in best_per_variant or c["score"] > best_per_variant[c["variant"]]:
                 best_per_variant[c["variant"]] = c["score"]
-        variants_to_rerun = needs_tiebreak_rerun(
+        variants_to_rerun = variants_needing_full_iteration_verification(
             [{"variant": v, "score": s} for v, s in best_per_variant.items()],
             threshold=tiebreak_threshold,
         )
         for variant_name in variants_to_rerun:
             variant = next(v for v in ALL_TRAINING_VARIANTS if v.name == variant_name)
-            full_checkpoint = final_train_fn(
-                filtered_scene, variant, scene_output / f"tiebreak_{variant.name}",
-            )
+            tiebreak_output_dir = scene_output / f"tiebreak_{variant.name}"
+            full_checkpoint = final_train_fn(filtered_scene, variant, tiebreak_output_dir)
+            render_config = _render_config_for(variant, tiebreak_output_dir)
             for candidate in candidates:
                 if candidate["variant"] != variant_name:
                     continue
@@ -1905,7 +2253,7 @@ def run_experiment_matrix_pipeline(
                 candidate["score"] = _score_checkpoint(
                     checkpoint, holdout_params, render_fn,
                     scene_output / f"tiebreak_holdout_{variant_name}_{candidate['floater_cleanup']}",
-                    working_scene.train_images_dir, lpips_model, psnr_max,
+                    working_scene.train_images_dir, lpips_model, psnr_max, render_config,
                 )
                 candidate["estimated_vram_bytes"] = estimate_vram_bytes(count_gaussians_in_ply(checkpoint))
                 candidate["checkpoint_path"] = str(checkpoint)
@@ -1917,17 +2265,18 @@ def run_experiment_matrix_pipeline(
                 k: v for k, v in extra.items()
                 if k not in ("variant", "floater_cleanup", "candidate_name")
             }
+            extra_output_dir = scene_output / f"extra_{extra['candidate_name']}"
             checkpoint = final_train_fn(
-                filtered_scene, variant, scene_output / f"extra_{extra['candidate_name']}",
-                hyperparam_overrides=overrides,
+                filtered_scene, variant, extra_output_dir, hyperparam_overrides=overrides,
             )
+            render_config = _render_config_for(variant, extra_output_dir)
             use_floater_cleanup = bool(extra.get("floater_cleanup", False))
             if use_floater_cleanup:
                 checkpoint = prune_fn(checkpoint, bbox_min, bbox_max)
             score = _score_checkpoint(
                 checkpoint, holdout_params, render_fn,
                 scene_output / f"extra_holdout_{extra['candidate_name']}",
-                working_scene.train_images_dir, lpips_model, psnr_max,
+                working_scene.train_images_dir, lpips_model, psnr_max, render_config,
             )
             candidates.append({
                 "variant": extra["variant"], "floater_cleanup": use_floater_cleanup,
@@ -1946,22 +2295,39 @@ def run_experiment_matrix_pipeline(
         full_training_scene = build_filtered_scene(
             working_scene, set(), scene_output / "full_scene",
         )
+        final_output_dir = scene_output / "final_train"
         final_checkpoint = final_train_fn(
-            full_training_scene, winning_variant, scene_output / "final_train",
+            full_training_scene, winning_variant, final_output_dir,
             hyperparam_overrides=winner.get("hyperparam_overrides"),
         )
+        final_render_config = _render_config_for(winning_variant, final_output_dir)
         if winner["floater_cleanup"]:
             final_checkpoint = prune_fn(final_checkpoint, bbox_min, bbox_max)
 
         test_render_dir = scene_output / "test_render"
         test_params_list = load_test_poses_csv(scene.test_poses_csv)
-        render_fn(final_checkpoint, test_params_list, test_render_dir)
+        render_fn(final_checkpoint, test_params_list, test_render_dir, render_config=final_render_config)
         scene_render_dirs[submission_dir] = test_render_dir
+
+    if result.skipped_scenes:
+        # Fail closed: the exam voids the ENTIRE score for a missing scene,
+        # so a submission.zip already known to be short a scene is worse
+        # than no zip at all -- same reasoning as Plan 1's
+        # run_baseline_pipeline (src/orchestrator/run_pipeline.py:169-179).
+        result.validation_problems = [
+            f"scene '{name}' skipped, no submission produced: {problems}"
+            for name, problems in result.skipped_scenes.items()
+        ]
+        result.submission_zip = None
+        return result
 
     submission_zip = output_root / "submission.zip"
     package_submission(scene_render_dirs, submission_zip)
     result.validation_problems = validate_submission(submission_zip, scenes)
-    result.submission_zip = submission_zip
+    # Fail closed: an artifact validate_submission already flagged as wrong
+    # must never be exposed as valid, even though the zip stays on disk for
+    # debugging -- same philosophy as Plan 1's run_pipeline.py:180-188.
+    result.submission_zip = submission_zip if not result.validation_problems else None
     return result
 ```
 
@@ -1970,13 +2336,13 @@ Create `src/orchestrator/__init__.py` if not already present from Plan 1.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/test_run_experiment_matrix.py -v`
-Expected: `PASS` (1 passed).
+Expected: `PASS` (2 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/orchestrator/run_experiment_matrix.py tests/test_run_experiment_matrix.py
-git commit -m "Add experiment-matrix orchestrator (screening/final split, undistort, bounded search)"
+git commit -m "Add experiment-matrix orchestrator (screening/final split, undistort fix, fair tie-break, render config, fail-closed)"
 ```
 
 - [ ] **Step 6: Manual verification on Colab (required, not optional)**
@@ -1985,19 +2351,22 @@ Run `run_experiment_matrix_pipeline` for `chair` alone first (cheapest scene) wi
 `screening_train_fn = functools.partial(run_training_variant, iterations=15000)` and
 `final_train_fn = functools.partial(run_training_variant, iterations=30000)`, no extra
 candidates. Confirm: all 5 variants train, `chosen_config["chair"]` is populated, `test_render/`
-has real images, `submission_zip` validates clean. Only then move to Task 16's full notebook
-wiring for all 7 scenes.
+has real images, `submission_zip` validates clean. Then specifically confirm the `anti_alias` and
+`appearance_embed` candidates' holdout renders visibly reflect their trained behavior (compare
+against the `baseline` candidate's holdout renders for the same scene) — this is what Task 15
+and this task's `_render_config_for` wiring exist to guarantee; do not trust it from code review
+alone. Only then move to Task 17's full notebook wiring for all 7 scenes.
 
 ---
 
-### Task 16: Wire Giai đoạn 1+2 into the Colab notebooks
+### Task 17: Wire Giai đoạn 1+2 into the Colab notebooks
 
 **Files:**
 - Modify: `notebooks/colab_runner_hcm.ipynb` (5 HCM scenes — Giai đoạn 1 only, no extras)
 - Modify: `notebooks/colab_runner_bonsai.ipynb` (`bonsai` + `chair` — Giai đoạn 1 + Giai đoạn 2)
 
 **Interfaces:**
-- Consumes: `run_experiment_matrix_pipeline` (Task 15), `build_hyperparam_candidates` (Task 11),
+- Consumes: `run_experiment_matrix_pipeline` (Task 16), `build_hyperparam_candidates` (Task 11),
   `write_reproducibility_bundle` (Task 8), `prune_checkpoint` (Task 14).
 
 Each scene is run through its own call to `run_experiment_matrix_pipeline` (`scenes=[scene]`),
@@ -2144,14 +2513,14 @@ git commit -m "Wire Giai doan 1+2 experiment matrix into both Colab notebooks"
 
 ---
 
-### Task 17: Final merge and reproducibility bundle close-out (Giai đoạn 3)
+### Task 18: Final merge and reproducibility bundle close-out (Giai đoạn 3)
 
 **Files:**
 - Modify: `notebooks/colab_runner_hcm.ipynb`
 
 **Interfaces:**
 - Consumes: the existing Bước 8 (7-scene) merge cell — already present, already scans
-  `OUTPUT_ROOT/<scene>/test_render/` for all 7 scenes, which is exactly where Task 15's
+  `OUTPUT_ROOT/<scene>/test_render/` for all 7 scenes, which is exactly where Task 16's
   `run_experiment_matrix_pipeline` writes its final render. No change needed to that cell logic.
   This task only adds packaging the reproducibility bundle **separately** from
   `submission.zip` — the exam's submission format (spec 1.5) allows only rendered images inside
@@ -2184,7 +2553,7 @@ else:
 
 - [ ] **Step 2: Manual verification on Colab (required)**
 
-After all 7 scenes have gone through Task 16's Bước 9 in their respective notebooks, run the
+After all 7 scenes have gone through Task 17's Bước 9 in their respective notebooks, run the
 existing Bước 8 merge cell, then this new Bước 10 cell. Confirm `submission.zip` validates clean
 (existing `validate_submission` check in Bước 8) and `reproducibility_bundle.zip` contains a
 subfolder per scene with `chosen_config.yaml` and `all_candidates_scores.csv`.
@@ -2203,26 +2572,57 @@ git commit -m "Add reproducibility bundle packaging, kept separate from submissi
 - **Spec coverage:** advanced-techniques building blocks → Task 1-8 (carried over from
   `docs/superpowers/plans/2026-07-18-advanced-techniques.md`, its own Task 11 already done and
   not repeated). Giai đoạn 0 (diagnosis) → Task 9/10/12. Giai đoạn 1 (5-variant matrix,
-  reduced-iteration screening, tie-break) → Task 11/13/14/15/16. Giai đoạn 2 (bounded
-  hyperparameter search for bonsai/chair) → Task 11/15/16. Giai đoạn 3 (final retrain, blind
-  render, reproducibility bundle, merge) → Task 15 (retrain+render+package are inside the
-  orchestrator itself) + Task 17 (reproducibility close-out). Out-of-scope items from the spec
+  reduced-iteration screening, tie-break) → Task 11/13/15/16/17. Giai đoạn 2 (bounded
+  hyperparameter search for bonsai/chair) → Task 11/16/17. Giai đoạn 3 (final retrain, blind
+  render, reproducibility bundle, merge) → Task 16 (retrain+render+package are inside the
+  orchestrator itself) + Task 18 (reproducibility close-out). Out-of-scope items from the spec
   (full grid across all 7 scenes, A100, parallel sessions) are not implemented anywhere in this
   plan.
 - **Placeholder scan:** no TBD/TODO; every code step has complete, runnable code; no "similar to
   Task N" shortcuts. Task 14 closes a real gap discovered while first drafting this plan: the
   original advanced-techniques document's Task 2 only produces `compute_prune_mask` (a
   boolean-array function over already-loaded Gaussian attributes, not file I/O) — nothing in that
-  document ever wraps it into a `checkpoint_path -> checkpoint_path` callable, which Task 15's
-  `prune_fn` parameter requires. Task 14 closes that gap, verified against the vendored
-  `GaussianModel.load_ply`/`prune_points`/`save_ply` methods in the actual checked-out submodule
-  (`third_party/gaussian-splatting/scene/gaussian_model.py:239,263,349`), including the
-  keep/prune mask polarity inversion `prune_points` requires.
+  document ever wraps it into a `checkpoint_path -> checkpoint_path` callable, which Task 16's
+  `prune_fn` parameter requires. Task 14 closes that gap.
 - **Type consistency:** `run_training_variant`'s `hyperparam_overrides` parameter (Task 13,
   included from the first draft rather than bolted on later) is used consistently with the same
-  name/shape (`dict[str, object] | None`) in Task 15's `final_train_fn` calls and Task 16's
+  name/shape (`dict[str, object] | None`) in Task 16's `final_train_fn` calls and Task 17's
   notebook cells. `ExperimentPipelineResult.chosen_config` entries carry an optional
-  `hyperparam_overrides` key (only present for Giai đoạn 2 candidates) — Task 15's final-retrain
+  `hyperparam_overrides` key (only present for Giai đoạn 2 candidates) — Task 16's final-retrain
   call uses `.get("hyperparam_overrides")`, `None` for the 10 base variant/floater candidates,
   the dict for extras. `prune_fn` is consistently `prune_checkpoint` (Task 14) everywhere it's
-  referenced: Task 15's test/interface, and both notebook cells in Task 16.
+  referenced: Task 16's test/interface, and both notebook cells in Task 17.
+- **External review pass (2026-07-23):** a second reviewer read the first draft of this plan
+  against the actual codebase and found 7 real defects, all confirmed by independently checking
+  the referenced files (not taken on faith — see the `superpowers:receiving-code-review` process
+  for how each was verified) and fixed in this revision:
+  1. *Critical* — `real_render_fn` rendered every checkpoint with all-default `pipe`/appearance
+     state regardless of which variant trained it, so `anti_alias`/`full_stack`/
+     `appearance_embed` checkpoints would have been scored and shipped as if those techniques
+     were off. Fixed by Task 15 (new: `render_config` parameter on `real_render_fn`) and Task 16
+     (`_render_config_for`, threaded through every render/score call site).
+  2. *High* — the tie-break re-run only re-verified the runner-up at full iterations, comparing
+     it unfairly against the leader's un-verified screening-iteration score. Fixed by Task 11's
+     `variants_needing_full_iteration_verification` (re-runs the leader too whenever any
+     runner-up is close) and Task 16 using it.
+  3. *High* — holdout camera focal length used `camera.params[0]`/`params[1]` directly, which is
+     wrong for `SIMPLE_PINHOLE` (`params[1]` is `cx`, not `fy`) — exactly the trap
+     `src/common/pose_utils.py`'s `camera_focal_lengths()` docstring already documents. Fixed in
+     Task 16 by using that existing helper instead of raw indexing.
+  4. *High* — a `{"iterations": N}` entry in `hyperparam_overrides` set `opt.iterations` but the
+     training loop's actual bound was the separate function parameter `iterations`, so the
+     override never changed how long training actually ran. Fixed in Task 13 via
+     `effective_iterations`, popped out of the overrides dict and used everywhere the loop bound,
+     save call, and checkpoint path are derived.
+  5. *High* — `prune_checkpoint` called `GaussianModel.prune_points()`, which requires
+     `self.optimizer` (only set by `training_setup()`, never called on a load-only path) and
+     would crash with `AttributeError: 'NoneType' object has no attribute 'param_groups'`. Fixed
+     in Task 14 by filtering the six tensors `save_ply` reads directly, with no optimizer
+     involved.
+  6. *Medium* — the orchestrator always produced a `submission_zip` regardless of skipped scenes
+     or validation problems, unlike Plan 1's deliberately fail-closed `run_baseline_pipeline`.
+     Fixed in Task 16 by replicating that exact fail-closed logic.
+  7. *Medium* — the reproducibility CSV's fixed `fieldnames` silently dropped
+     `candidate_name`/`hyperparam_overrides`/`fallback_reason`, losing exactly the information
+     needed to trace which Giai đoạn 2 override actually won for `bonsai`/`chair`. Fixed in
+     Task 8 by adding those columns (JSON-encoding `hyperparam_overrides`).
