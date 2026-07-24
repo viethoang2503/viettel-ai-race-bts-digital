@@ -43,16 +43,31 @@ def _default_opt_and_pipe():
 
 
 def _load_gaussians(checkpoint_path: Path):
+    checkpoint_path = Path(checkpoint_path)
+    suffix = checkpoint_path.suffix.lower()
+    if suffix not in {".ply", ".pth"}:
+        raise ValueError(
+            f"unsupported gaussian checkpoint format: {checkpoint_path}"
+        )
+
     from scene.gaussian_model import GaussianModel
+
+    gaussians = GaussianModel(sh_degree=3)  # matches ModelParams default
+
+    if suffix == ".ply":
+        gaussians.load_ply(str(checkpoint_path))
+        return gaussians
 
     # weights_only=False: this is our own checkpoint, produced by
     # gaussians.capture() (a tuple of tensors + optimizer state dict, not
     # just a plain state_dict) — PyTorch 2.6's default weights_only=True
     # rejects the plain Python types mixed into that tuple/optimizer
     # state. Trusted since we produced it ourselves in this same pipeline.
-    model_args, _first_iter = torch.load(checkpoint_path, weights_only=False)
+    model_args, _first_iter = torch.load(
+        checkpoint_path,
+        weights_only=False,
+    )
     opt, _pipe = _default_opt_and_pipe()
-    gaussians = GaussianModel(sh_degree=3)  # matches ModelParams default
     # GaussianModel.restore() unconditionally calls training_setup(), which
     # builds an optimizer over self._exposure — but that attribute is only
     # ever created by create_from_pcd() (the fresh-training path in
@@ -74,8 +89,20 @@ def _load_gaussians(checkpoint_path: Path):
     return gaussians
 
 
+def _parse_render_config(
+    render_config: dict | None,
+) -> tuple[bool, Path | None]:
+    render_config = render_config or {}
+    appearance_path = render_config.get("appearance_path")
+    return (
+        bool(render_config.get("antialiasing", False)),
+        Path(appearance_path) if appearance_path is not None else None,
+    )
+
+
 def real_render_fn(
     checkpoint: Path, params_list: list[CameraParams], output_dir: Path,
+    render_config: dict | None = None,
 ) -> list[Path]:
     """GPU-only: loads the trained GaussianModel and renders every camera
     in params_list via the vendored gaussian_renderer.render(). Manual
@@ -84,9 +111,21 @@ def real_render_fn(
     """
     from gaussian_renderer import render as gs_render
     from scene.cameras import Camera
+    from src.training.appearance_embedding import apply_appearance
 
     gaussians = _load_gaussians(checkpoint)
     _opt, pipe = _default_opt_and_pipe()
+    antialiasing, appearance_path = _parse_render_config(render_config)
+    pipe.antialiasing = antialiasing
+
+    appearance_affine_bias = None
+    if appearance_path is not None and appearance_path.exists():
+        saved = torch.load(appearance_path, weights_only=False)
+        appearance_affine_bias = (
+            saved["affine"].cuda(),
+            saved["bias"].cuda(),
+        )
+
     background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
     def _render_one(params: CameraParams, gaussians) -> np.ndarray:
@@ -104,6 +143,9 @@ def real_render_fn(
             uid=0,
         )
         rendered = gs_render(camera, gaussians, pipe, background)["render"]
+        if appearance_affine_bias is not None:
+            affine, bias = appearance_affine_bias
+            rendered = apply_appearance(rendered, affine, bias)
         return _tensor_to_uint8_image(rendered)
 
     return render_all(

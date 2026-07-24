@@ -1,7 +1,16 @@
+import inspect
+
 import numpy as np
+import pytest
 import torch
 
-from src.rendering.gs_render_fn import _placeholder_image, _tensor_to_uint8_image
+from src.rendering.gs_render_fn import (
+    _load_gaussians,
+    _parse_render_config,
+    _placeholder_image,
+    _tensor_to_uint8_image,
+    real_render_fn,
+)
 
 
 def test_placeholder_image_has_requested_size():
@@ -28,3 +37,34 @@ def test_tensor_to_uint8_image_clamps_out_of_range_values():
     tensor = torch.full((3, 1, 1), 2.0)  # out of [0, 1] range
     array = _tensor_to_uint8_image(tensor)
     assert (array == 255).all()
+
+
+def test_real_render_fn_accepts_optional_render_config():
+    parameter = inspect.signature(real_render_fn).parameters["render_config"]
+    assert parameter.default is None
+
+
+def test_parse_render_config_preserves_backward_compatible_defaults():
+    antialiasing, appearance_path = _parse_render_config(None)
+    assert antialiasing is False
+    assert appearance_path is None
+
+
+def test_parse_render_config_returns_variant_settings(tmp_path):
+    appearance_path = tmp_path / "mean_appearance.pt"
+    antialiasing, parsed_path = _parse_render_config(
+        {
+            "antialiasing": True,
+            "appearance_path": appearance_path,
+        }
+    )
+    assert antialiasing is True
+    assert parsed_path == appearance_path
+
+
+def test_load_gaussians_rejects_unsupported_checkpoint_before_cuda_work(tmp_path):
+    checkpoint = tmp_path / "checkpoint.xyz"
+    checkpoint.touch()
+
+    with pytest.raises(ValueError, match="unsupported gaussian checkpoint format"):
+        _load_gaussians(checkpoint)
