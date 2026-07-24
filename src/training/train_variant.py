@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from src.common.config import SceneConfig
+from src.training.gs_train_fn import _scene_fingerprint
 
 _VENDORED_REPO = (
     Path(__file__).resolve().parents[2]
     / "third_party"
     / "gaussian-splatting"
 )
+_VARIANT_CHECKPOINT_RE = re.compile(r"variant_chkpnt(\d+)\.pth$")
+_VARIANT_MANIFEST = "variant_run.json"
 if str(_VENDORED_REPO) not in sys.path:
     sys.path.insert(0, str(_VENDORED_REPO))
 
@@ -56,6 +62,182 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _checkpoint_schedule(
+    iterations: int,
+    interval: int = 5000,
+) -> list[int]:
+    scheduled = list(range(interval, iterations, interval))
+    scheduled.append(iterations)
+    return scheduled
+
+
+def _variant_run_fingerprint(
+    scene: SceneConfig,
+    variant: TrainingVariant,
+    iterations: int,
+    hyperparam_overrides: dict[str, object] | None,
+    seed: int,
+) -> str:
+    payload = {
+        "scene_fingerprint": _scene_fingerprint(scene, iterations),
+        "variant": {
+            "name": variant.name,
+            "use_depth_reg": variant.use_depth_reg,
+            "use_anti_alias": variant.use_anti_alias,
+            "use_appearance_embed": variant.use_appearance_embed,
+        },
+        "iterations": iterations,
+        "hyperparam_overrides": hyperparam_overrides or {},
+        "seed": seed,
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _find_latest_matching_checkpoint(
+    output_dir: Path,
+    fingerprint: str,
+) -> tuple[Path | None, dict | None]:
+    import torch
+
+    candidates = []
+    for path in Path(output_dir).glob("variant_chkpnt*.pth"):
+        match = _VARIANT_CHECKPOINT_RE.fullmatch(path.name)
+        if match:
+            candidates.append((int(match.group(1)), path))
+    for _iteration, path in sorted(candidates, reverse=True):
+        payload = torch.load(path, weights_only=False)
+        if payload.get("fingerprint") == fingerprint:
+            return path, payload
+    return None, None
+
+
+def _completed_variant_path(
+    output_dir: Path,
+    fingerprint: str,
+    needs_appearance: bool,
+) -> Path | None:
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / _VARIANT_MANIFEST
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if manifest.get("fingerprint") != fingerprint:
+        return None
+    final_path = Path(manifest.get("final_checkpoint_path", ""))
+    if not final_path.is_file():
+        return None
+    if needs_appearance and not (output_dir / "mean_appearance.pt").is_file():
+        return None
+    return final_path
+
+
+def _capture_rng_state() -> dict:
+    import torch
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def _restore_rng_state(state: dict) -> None:
+    import torch
+
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _atomic_write_json(payload: dict, path: Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _build_variant_checkpoint_payload(
+    gaussians,
+    appearance,
+    appearance_optimizer,
+    iteration: int,
+    fingerprint: str,
+) -> dict:
+    return {
+        "iteration": iteration,
+        "fingerprint": fingerprint,
+        "gaussians": gaussians.capture(),
+        "appearance": (
+            appearance.state_dict()
+            if appearance is not None
+            else None
+        ),
+        "appearance_optimizer": (
+            appearance_optimizer.state_dict()
+            if appearance_optimizer is not None
+            else None
+        ),
+        "rng": _capture_rng_state(),
+    }
+
+
+def _restore_variant_checkpoint(
+    payload: dict,
+    gaussians,
+    opt,
+    appearance,
+    appearance_optimizer,
+) -> None:
+    gaussians.restore(payload["gaussians"], opt)
+    if appearance is not None:
+        if payload.get("appearance") is None:
+            raise ValueError("resume checkpoint is missing appearance state")
+        appearance.load_state_dict(payload["appearance"])
+        if payload.get("appearance_optimizer") is None:
+            raise ValueError(
+                "resume checkpoint is missing appearance optimizer state"
+            )
+        appearance_optimizer.load_state_dict(
+            payload["appearance_optimizer"]
+        )
+    _restore_rng_state(payload["rng"])
 
 
 def _build_dataset_args(
@@ -186,11 +368,29 @@ def run_training_variant(
         seed,
         checkpoint_interval,
     )
+    fingerprint = _variant_run_fingerprint(
+        scene,
+        variant,
+        effective_iterations,
+        hyperparam_overrides,
+        seed,
+    )
+    completed_path = _completed_variant_path(
+        output_dir,
+        fingerprint,
+        needs_appearance=variant.use_appearance_embed,
+    )
+    if completed_path is not None:
+        return completed_path
+
+    _resume_path, resume_payload = _find_latest_matching_checkpoint(
+        output_dir,
+        fingerprint,
+    )
     _seed_everything(seed)
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     gs_scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
 
     sparse = (
         load_sparse_scene(scene.sparse_dir)
@@ -209,11 +409,25 @@ def run_training_variant(
         if variant.use_appearance_embed
         else None
     )
+    appearance_optimizer = None
     if appearance is not None:
         appearance_optimizer = torch.optim.Adam(
             appearance.parameters(),
             lr=1e-3,
         )
+
+    if resume_payload is None:
+        gaussians.training_setup(opt)
+        first_iteration = 1
+    else:
+        _restore_variant_checkpoint(
+            resume_payload,
+            gaussians,
+            opt,
+            appearance,
+            appearance_optimizer,
+        )
+        first_iteration = int(resume_payload["iteration"]) + 1
 
     background = torch.tensor(
         [0.0, 0.0, 0.0],
@@ -221,7 +435,13 @@ def run_training_variant(
         device="cuda",
     )
 
-    for iteration in range(1, effective_iterations + 1):
+    checkpoint_iterations = set(
+        _checkpoint_schedule(
+            effective_iterations,
+            checkpoint_interval,
+        )
+    )
+    for iteration in range(first_iteration, effective_iterations + 1):
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -307,16 +527,39 @@ def run_training_variant(
                 appearance_optimizer.step()
                 appearance_optimizer.zero_grad(set_to_none=True)
 
+        if iteration in checkpoint_iterations:
+            checkpoint_payload = _build_variant_checkpoint_payload(
+                gaussians,
+                appearance,
+                appearance_optimizer,
+                iteration,
+                fingerprint,
+            )
+            _atomic_torch_save(
+                checkpoint_payload,
+                output_dir / f"variant_chkpnt{iteration}.pth",
+            )
+
     if appearance is not None:
         _save_mean_appearance(appearance, output_dir)
 
     gs_scene.save(effective_iterations)
-    return (
+    final_path = (
         output_dir
         / "point_cloud"
         / f"iteration_{effective_iterations}"
         / "point_cloud.ply"
     )
+    _atomic_write_json(
+        {
+            "fingerprint": fingerprint,
+            "iteration": effective_iterations,
+            "seed": seed,
+            "final_checkpoint_path": str(final_path.resolve()),
+        },
+        output_dir / _VARIANT_MANIFEST,
+    )
+    return final_path
 
 
 def _save_mean_appearance(appearance, output_dir: Path) -> None:

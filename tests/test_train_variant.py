@@ -1,18 +1,28 @@
 import inspect
+import json
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from src.common.config import SceneConfig
 from src.training.train_variant import (
     ALL_TRAINING_VARIANTS,
     TrainingVariant,
     _apply_hyperparam_overrides,
+    _atomic_torch_save,
+    _build_variant_checkpoint_payload,
     _build_dataset_args,
+    _checkpoint_schedule,
+    _completed_variant_path,
+    _find_latest_matching_checkpoint,
     _prepare_depth_regularization_inputs,
+    _restore_variant_checkpoint,
     _seed_everything,
+    _variant_run_fingerprint,
     _validate_training_request,
     run_training_variant,
 )
@@ -94,6 +104,170 @@ def test_validate_training_request_rejects_invalid_values(
 ):
     with pytest.raises(ValueError, match=message):
         _validate_training_request(iterations, seed, checkpoint_interval)
+
+
+def test_variant_checkpoint_schedule_includes_intervals_and_final():
+    assert _checkpoint_schedule(12_000, 5_000) == [5_000, 10_000, 12_000]
+    assert _checkpoint_schedule(10_000, 5_000) == [5_000, 10_000]
+    assert _checkpoint_schedule(200, 5_000) == [200]
+
+
+def _fingerprint_scene(tmp_path):
+    images = tmp_path / "images"
+    sparse = tmp_path / "sparse" / "0"
+    images.mkdir(parents=True)
+    sparse.mkdir(parents=True)
+    (images / "frame.jpg").write_bytes(b"pixels")
+    for name in ("cameras.bin", "images.bin", "points3D.bin"):
+        (sparse / name).write_bytes(name.encode())
+    return SceneConfig(
+        name="chair",
+        root=tmp_path,
+        train_images_dir=images,
+        sparse_dir=sparse,
+        test_poses_csv=tmp_path / "test.csv",
+    )
+
+
+def test_variant_fingerprint_changes_with_seed_variant_and_overrides(tmp_path):
+    scene = _fingerprint_scene(tmp_path)
+    baseline = ALL_TRAINING_VARIANTS[0]
+    depth = ALL_TRAINING_VARIANTS[1]
+    original = _variant_run_fingerprint(
+        scene, baseline, 100, {"densify_grad_threshold": 0.001}, 7,
+    )
+
+    assert original != _variant_run_fingerprint(
+        scene, baseline, 100, {"densify_grad_threshold": 0.001}, 8,
+    )
+    assert original != _variant_run_fingerprint(
+        scene, depth, 100, {"densify_grad_threshold": 0.001}, 7,
+    )
+    assert original != _variant_run_fingerprint(
+        scene, baseline, 100, {"densify_grad_threshold": 0.002}, 7,
+    )
+
+
+def test_atomic_torch_save_replaces_target_without_leaving_temp(tmp_path):
+    target = tmp_path / "variant_chkpnt5.pth"
+
+    _atomic_torch_save({"iteration": 5}, target)
+
+    assert torch.load(target, weights_only=False)["iteration"] == 5
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_find_latest_matching_checkpoint_ignores_stale_fingerprint(tmp_path):
+    _atomic_torch_save(
+        {"iteration": 5, "fingerprint": "matching"},
+        tmp_path / "variant_chkpnt5.pth",
+    )
+    _atomic_torch_save(
+        {"iteration": 10, "fingerprint": "stale"},
+        tmp_path / "variant_chkpnt10.pth",
+    )
+
+    path, payload = _find_latest_matching_checkpoint(tmp_path, "matching")
+
+    assert path.name == "variant_chkpnt5.pth"
+    assert payload["iteration"] == 5
+
+
+def test_completed_variant_requires_matching_manifest_and_appearance(tmp_path):
+    final_ply = tmp_path / "point_cloud" / "iteration_10" / "point_cloud.ply"
+    final_ply.parent.mkdir(parents=True)
+    final_ply.write_bytes(b"ply")
+    (tmp_path / "variant_run.json").write_text(json.dumps({
+        "fingerprint": "expected",
+        "iteration": 10,
+        "final_checkpoint_path": str(final_ply),
+    }))
+
+    assert _completed_variant_path(
+        tmp_path, "expected", needs_appearance=False,
+    ) == final_ply
+    assert _completed_variant_path(
+        tmp_path, "other", needs_appearance=False,
+    ) is None
+    assert _completed_variant_path(
+        tmp_path, "expected", needs_appearance=True,
+    ) is None
+
+    torch.save(
+        {"affine": torch.eye(3), "bias": torch.zeros(3)},
+        tmp_path / "mean_appearance.pt",
+    )
+    assert _completed_variant_path(
+        tmp_path, "expected", needs_appearance=True,
+    ) == final_ply
+
+
+def test_variant_checkpoint_payload_contains_model_appearance_and_rng(monkeypatch):
+    class _Stateful:
+        def __init__(self, state):
+            self.state = state
+
+        def state_dict(self):
+            return self.state
+
+    gaussians = SimpleNamespace(capture=lambda: ("gaussian-state",))
+    appearance = _Stateful({"affine": torch.tensor([1.0])})
+    optimizer = _Stateful({"step": 7})
+    monkeypatch.setattr(
+        "src.training.train_variant._capture_rng_state",
+        lambda: {"python": "rng"},
+    )
+
+    payload = _build_variant_checkpoint_payload(
+        gaussians,
+        appearance,
+        optimizer,
+        iteration=5000,
+        fingerprint="abc",
+    )
+
+    assert payload["iteration"] == 5000
+    assert payload["fingerprint"] == "abc"
+    assert payload["gaussians"] == ("gaussian-state",)
+    assert payload["appearance"] == {"affine": torch.tensor([1.0])}
+    assert payload["appearance_optimizer"] == {"step": 7}
+    assert payload["rng"] == {"python": "rng"}
+
+
+def test_restore_variant_checkpoint_restores_all_available_state(monkeypatch):
+    calls = []
+
+    class _Restorable:
+        def restore(self, state, opt):
+            calls.append(("gaussians", state, opt))
+
+        def load_state_dict(self, state):
+            calls.append(("state", state))
+
+    monkeypatch.setattr(
+        "src.training.train_variant._restore_rng_state",
+        lambda state: calls.append(("rng", state)),
+    )
+    opt = object()
+    payload = {
+        "gaussians": "gaussian-state",
+        "appearance": {"affine": 1},
+        "appearance_optimizer": {"step": 7},
+        "rng": {"python": "rng"},
+    }
+
+    _restore_variant_checkpoint(
+        payload,
+        _Restorable(),
+        opt,
+        _Restorable(),
+        _Restorable(),
+    )
+
+    assert ("gaussians", "gaussian-state", opt) in calls
+    assert ("state", {"affine": 1}) in calls
+    assert ("state", {"step": 7}) in calls
+    assert ("rng", {"python": "rng"}) in calls
 
 
 def test_build_dataset_args_preserves_full_resolution_and_safe_densification(
