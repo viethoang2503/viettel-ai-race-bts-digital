@@ -112,4 +112,3 @@ The final verification command is:
 Real Colab verification then runs one short `chair` baseline/depth/appearance
 smoke test, one HCM depth smoke test, an interrupted/resumed run, floater
 pruning, and a final render with measured VRAM before starting the full matrix.
-

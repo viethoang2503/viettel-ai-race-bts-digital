@@ -125,8 +125,13 @@ def _load_appearance_affine_bias(
 
 
 def _run_inference(callable_, *args, **kwargs):
-    with torch.inference_mode():
-        return callable_(*args, **kwargs)
+    try:
+        with torch.inference_mode():
+            return callable_(*args, **kwargs)
+    except torch.cuda.OutOfMemoryError as error:
+        raise VramBudgetExceededError(
+            f"CUDA out of memory during inference: {error}"
+        ) from error
 
 
 def _validate_peak_vram(

@@ -78,6 +78,14 @@ def test_run_inference_disables_gradient_tracking():
     assert _run_inference(lambda: torch.is_grad_enabled()) is False
 
 
+def test_run_inference_translates_cuda_oom_to_budget_error():
+    def raise_cuda_oom():
+        raise torch.cuda.OutOfMemoryError("allocation failed")
+
+    with pytest.raises(VramBudgetExceededError, match="CUDA out of memory"):
+        _run_inference(raise_cuda_oom)
+
+
 def test_validate_peak_vram_raises_descriptive_error():
     with pytest.raises(VramBudgetExceededError, match="1200.*1000"):
         _validate_peak_vram(peak_bytes=1200, budget_bytes=1000)

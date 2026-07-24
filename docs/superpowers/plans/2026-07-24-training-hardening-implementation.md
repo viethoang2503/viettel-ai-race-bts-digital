@@ -408,4 +408,3 @@ Run these in order after pushing:
 4. Prune and render the short PLY with antialiasing/appearance enabled.
 5. Confirm final estimated and measured VRAM metadata are present.
 6. Only after all five checks pass, run the full seven-scene matrix.
-
