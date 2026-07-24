@@ -1,6 +1,11 @@
 import numpy as np
+import torch
+import torch.nn as nn
 
-from src.postprocess.prune_floaters import compute_prune_mask
+from src.postprocess.prune_floaters import (
+    _filter_gaussian_parameters,
+    compute_prune_mask,
+)
 
 
 def test_keeps_normal_gaussians_inside_bbox():
@@ -45,3 +50,39 @@ def test_prunes_outlier_scale_gaussian():
     )
     assert mask[0] == False
     assert mask[1:].all()
+
+
+def test_filter_gaussian_parameters_filters_all_six_saved_tensors():
+    class _FakeGaussians:
+        pass
+
+    gaussians = _FakeGaussians()
+    gaussians._xyz = nn.Parameter(torch.arange(12).reshape(4, 3).float())
+    gaussians._features_dc = nn.Parameter(torch.arange(12).reshape(4, 1, 3).float())
+    gaussians._features_rest = nn.Parameter(torch.arange(24).reshape(4, 2, 3).float())
+    gaussians._opacity = nn.Parameter(torch.arange(4).reshape(4, 1).float())
+    gaussians._scaling = nn.Parameter(torch.arange(12).reshape(4, 3).float())
+    gaussians._rotation = nn.Parameter(torch.arange(16).reshape(4, 4).float())
+
+    _filter_gaussian_parameters(
+        gaussians,
+        np.array([True, False, True, False]),
+    )
+
+    for name in (
+        "_xyz",
+        "_features_dc",
+        "_features_rest",
+        "_opacity",
+        "_scaling",
+        "_rotation",
+    ):
+        tensor = getattr(gaussians, name)
+        assert isinstance(tensor, nn.Parameter)
+        assert tensor.shape[0] == 2
+        assert tensor.requires_grad
+
+    torch.testing.assert_close(
+        gaussians._xyz,
+        torch.tensor([[0.0, 1.0, 2.0], [6.0, 7.0, 8.0]]),
+    )
