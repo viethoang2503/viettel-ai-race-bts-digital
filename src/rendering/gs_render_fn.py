@@ -16,6 +16,10 @@ if str(_GS_ROOT) not in sys.path:
     sys.path.insert(0, str(_GS_ROOT))
 
 
+class VramBudgetExceededError(RuntimeError):
+    """Raised when a checkpoint or render cannot fit the target GPU budget."""
+
+
 def _placeholder_image(width: int, height: int) -> Image.Image:
     """Blank image only used to give Camera.__init__ a pixel size to
     resize to (via PILtoTorch) — novel test poses have no ground-truth
@@ -91,13 +95,49 @@ def _load_gaussians(checkpoint_path: Path):
 
 def _parse_render_config(
     render_config: dict | None,
-) -> tuple[bool, Path | None]:
+) -> tuple[bool, Path | None, int | None]:
     render_config = render_config or {}
     appearance_path = render_config.get("appearance_path")
+    vram_budget = render_config.get("vram_budget_bytes")
+    if vram_budget is not None:
+        vram_budget = int(vram_budget)
+        if vram_budget <= 0:
+            raise ValueError("vram_budget_bytes must be positive")
     return (
         bool(render_config.get("antialiasing", False)),
         Path(appearance_path) if appearance_path is not None else None,
+        vram_budget,
     )
+
+
+def _load_appearance_affine_bias(
+    appearance_path: Path | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if appearance_path is None:
+        return None
+    appearance_path = Path(appearance_path)
+    if not appearance_path.is_file():
+        raise FileNotFoundError(
+            f"requested appearance artifact does not exist: {appearance_path}"
+        )
+    saved = torch.load(appearance_path, weights_only=False)
+    return saved["affine"].cuda(), saved["bias"].cuda()
+
+
+def _run_inference(callable_, *args, **kwargs):
+    with torch.inference_mode():
+        return callable_(*args, **kwargs)
+
+
+def _validate_peak_vram(
+    peak_bytes: int,
+    budget_bytes: int | None,
+) -> None:
+    if budget_bytes is not None and peak_bytes > budget_bytes:
+        raise VramBudgetExceededError(
+            f"render peak VRAM {peak_bytes} bytes exceeds budget "
+            f"{budget_bytes} bytes"
+        )
 
 
 def real_render_fn(
@@ -113,18 +153,17 @@ def real_render_fn(
     from scene.cameras import Camera
     from src.training.appearance_embedding import apply_appearance
 
+    antialiasing, appearance_path, vram_budget = _parse_render_config(
+        render_config
+    )
+    if vram_budget is not None and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     gaussians = _load_gaussians(checkpoint)
     _opt, pipe = _default_opt_and_pipe()
-    antialiasing, appearance_path = _parse_render_config(render_config)
     pipe.antialiasing = antialiasing
 
-    appearance_affine_bias = None
-    if appearance_path is not None and appearance_path.exists():
-        saved = torch.load(appearance_path, weights_only=False)
-        appearance_affine_bias = (
-            saved["affine"].cuda(),
-            saved["bias"].cuda(),
-        )
+    appearance_affine_bias = _load_appearance_affine_bias(appearance_path)
 
     background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
@@ -148,7 +187,22 @@ def real_render_fn(
             rendered = apply_appearance(rendered, affine, bias)
         return _tensor_to_uint8_image(rendered)
 
-    return render_all(
-        checkpoint, None, output_dir, _render_one,
-        params_list=params_list, gaussians=gaussians,
+    written = _run_inference(
+        render_all,
+        checkpoint,
+        None,
+        output_dir,
+        _render_one,
+        params_list=params_list,
+        gaussians=gaussians,
     )
+    if vram_budget is not None:
+        peak_bytes = (
+            int(torch.cuda.max_memory_allocated())
+            if torch.cuda.is_available()
+            else 0
+        )
+        if render_config is not None:
+            render_config["measured_peak_vram_bytes"] = peak_bytes
+        _validate_peak_vram(peak_bytes, vram_budget)
+    return written

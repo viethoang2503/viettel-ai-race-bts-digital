@@ -25,6 +25,7 @@ from src.postprocess.vram_guard import (
     count_gaussians_in_ply,
     estimate_vram_bytes,
 )
+from src.rendering.gs_render_fn import VramBudgetExceededError
 from src.rendering.render_from_csv import CameraParams, load_test_poses_csv
 from src.submission.package_submission import package_submission
 from src.submission.validate_submission import validate_submission
@@ -125,6 +126,19 @@ def _score_checkpoint(
 
 def _candidate_vram_bytes(checkpoint: Path) -> int:
     return estimate_vram_bytes(count_gaussians_in_ply(checkpoint))
+
+
+def _ensure_checkpoint_fits_budget(
+    checkpoint: Path,
+    budget_bytes: int,
+) -> int:
+    estimated_bytes = _candidate_vram_bytes(checkpoint)
+    if estimated_bytes > budget_bytes:
+        raise VramBudgetExceededError(
+            f"final checkpoint {checkpoint} requires an estimated "
+            f"{estimated_bytes} bytes, exceeding budget {budget_bytes} bytes"
+        )
+    return estimated_bytes
 
 
 def run_experiment_matrix_pipeline(
@@ -405,26 +419,45 @@ def run_experiment_matrix_pipeline(
                 bbox_min,
                 bbox_max,
             )
+        try:
+            final_estimated_vram = _ensure_checkpoint_fits_budget(
+                final_checkpoint,
+                vram_budget_bytes,
+            )
+        except VramBudgetExceededError as error:
+            result.validation_problems.append(
+                f"scene '{scene.name}': {error}"
+            )
+            continue
+        winner["final_estimated_vram_bytes"] = final_estimated_vram
+        final_render_config["vram_budget_bytes"] = vram_budget_bytes
 
         test_render_dir = scene_output / "test_render"
         test_params_list = load_test_poses_csv(
             scene.test_poses_csv
         )
-        render_fn(
-            final_checkpoint,
-            test_params_list,
-            test_render_dir,
-            render_config=final_render_config,
-        )
+        try:
+            render_fn(
+                final_checkpoint,
+                test_params_list,
+                test_render_dir,
+                render_config=final_render_config,
+            )
+        except VramBudgetExceededError as error:
+            result.validation_problems.append(
+                f"scene '{scene.name}': {error}"
+            )
+            continue
         scene_render_dirs[
             scene.effective_submission_dir
         ] = test_render_dir
 
     if result.skipped_scenes:
-        result.validation_problems = [
+        result.validation_problems.extend(
             f"scene '{name}' skipped, no submission produced: {problems}"
             for name, problems in result.skipped_scenes.items()
-        ]
+        )
+    if result.skipped_scenes or result.validation_problems:
         result.submission_zip = None
         return result
 

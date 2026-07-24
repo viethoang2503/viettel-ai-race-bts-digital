@@ -1,13 +1,16 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
 from src.common.config import SceneConfig
 from src.orchestrator.run_experiment_matrix import (
+    _ensure_checkpoint_fits_budget,
     run_experiment_matrix_pipeline,
 )
+from src.rendering.gs_render_fn import VramBudgetExceededError
 
 
 def _chair_scene():
@@ -27,12 +30,24 @@ class _StubLpipsModel:
         return torch.tensor(diff)
 
 
-def _write_fake_ply(path: Path) -> None:
+def _write_fake_ply(path: Path, num_vertices: int = 10) -> None:
     path.write_bytes(
-        b"ply\nformat binary_little_endian 1.0\nelement vertex 10\n"
+        (
+            "ply\nformat binary_little_endian 1.0\n"
+            f"element vertex {num_vertices}\n"
+        ).encode()
+        +
         b"property float x\nproperty float y\nproperty float z\nend_header\n"
         + b"\x00" * 120
     )
+
+
+def test_final_checkpoint_preflight_rejects_over_budget_ply(tmp_path):
+    checkpoint = tmp_path / "huge.ply"
+    _write_fake_ply(checkpoint, num_vertices=500_000_000)
+
+    with pytest.raises(VramBudgetExceededError, match="final checkpoint"):
+        _ensure_checkpoint_fits_budget(checkpoint, budget_bytes=1_000)
 
 
 def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for_winner(
@@ -191,7 +206,14 @@ def test_run_experiment_matrix_fails_closed_when_a_scene_is_skipped(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         ply = output_dir / "point_cloud.ply"
-        _write_fake_ply(ply)
+        _write_fake_ply(
+            ply,
+            num_vertices=(
+                500_000_000
+                if "final_train" in str(output_dir)
+                else 10
+            ),
+        )
         return ply
 
     def fake_render_fn(
@@ -236,3 +258,7 @@ def test_run_experiment_matrix_fails_closed_when_a_scene_is_skipped(
     assert "does_not_exist" in result.skipped_scenes
     assert "chair" in result.chosen_config
     assert result.submission_zip is None
+    assert any(
+        "final checkpoint" in problem
+        for problem in result.validation_problems
+    )
