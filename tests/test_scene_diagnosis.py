@@ -4,7 +4,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-from src.diagnostics.scene_diagnosis import compute_per_image_metrics
+from src.diagnostics.scene_diagnosis import (
+    compute_per_image_metrics,
+    rank_holdout_by_score,
+)
 
 
 class _StubLpipsModel:
@@ -61,3 +64,21 @@ def test_compute_per_image_metrics_skips_predictions_with_no_matching_ground_tru
     )
 
     assert set(result.keys()) == {"frame_0001.jpg"}
+
+
+def test_rank_holdout_by_score_sorts_worst_first():
+    per_image = {
+        "good.jpg": {"lpips": 0.1, "ssim": 0.9, "psnr": 28.0, "score": 0.85},
+        "bad.jpg": {"lpips": 0.6, "ssim": 0.4, "psnr": 12.0, "score": 0.30},
+        "medium.jpg": {"lpips": 0.3, "ssim": 0.6, "psnr": 20.0, "score": 0.55},
+    }
+    ranked = rank_holdout_by_score(per_image)
+    assert ranked == [
+        ("bad.jpg", 0.30),
+        ("medium.jpg", 0.55),
+        ("good.jpg", 0.85),
+    ]
+
+
+def test_rank_holdout_by_score_handles_empty_input():
+    assert rank_holdout_by_score({}) == []

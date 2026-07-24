@@ -38,3 +38,15 @@ def compute_per_image_metrics(
         result[pred_path.name] = {**metrics, "score": score}
 
     return result
+
+
+def rank_holdout_by_score(
+    per_image_metrics: dict[str, dict[str, float]],
+) -> list[tuple[str, float]]:
+    return sorted(
+        (
+            (name, metrics["score"])
+            for name, metrics in per_image_metrics.items()
+        ),
+        key=lambda pair: pair[1],
+    )
