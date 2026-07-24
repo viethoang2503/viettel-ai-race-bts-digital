@@ -185,6 +185,101 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     assert result.submission_zip.exists()
 
 
+def test_run_experiment_matrix_screens_only_the_given_variant_subset(tmp_path):
+    from src.training.train_variant import ALL_TRAINING_VARIANTS
+
+    scene = _chair_scene()
+    screening_calls = []
+
+    def fake_screening_train_fn(scene_arg, variant, output_dir, seed=0):
+        screening_calls.append(variant.name)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ply = output_dir / "point_cloud.ply"
+        _write_fake_ply(ply)
+        return ply
+
+    def fake_final_train_fn(
+        scene_arg,
+        variant,
+        output_dir,
+        hyperparam_overrides=None,
+        seed=0,
+    ):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ply = output_dir / "point_cloud.ply"
+        _write_fake_ply(ply)
+        return ply
+
+    def fake_render_fn(checkpoint, params_list, output_dir, render_config=None):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fill = hash(str(checkpoint)) % 200
+        written = []
+        for params in params_list:
+            path = output_dir / params.image_name
+            Image.fromarray(
+                np.full((params.height, params.width, 3), fill, dtype=np.uint8)
+            ).save(path)
+            written.append(path)
+        return written
+
+    def fake_prune_fn(checkpoint_path, bbox_min, bbox_max):
+        pruned = Path(checkpoint_path).with_name("point_cloud_pruned.ply")
+        pruned.write_bytes(Path(checkpoint_path).read_bytes())
+        return pruned
+
+    reduced_variants = [
+        v for v in ALL_TRAINING_VARIANTS
+        if v.name in ("baseline", "depth_reg", "full_stack")
+    ]
+
+    result = run_experiment_matrix_pipeline(
+        scenes=[scene],
+        screening_train_fn=fake_screening_train_fn,
+        final_train_fn=fake_final_train_fn,
+        render_fn=fake_render_fn,
+        prune_fn=fake_prune_fn,
+        lpips_model=_StubLpipsModel(),
+        psnr_max=30.0,
+        vram_budget_bytes=16 * 1024**3,
+        output_root=tmp_path,
+        variants=reduced_variants,
+    )
+
+    # Only the 3 requested variants were screened, not all 5 -- anti_alias
+    # and appearance_embed must never be trained when the caller asked for
+    # a reduced GPU-budget-conscious subset.
+    assert set(screening_calls) == {"baseline", "depth_reg", "full_stack"}
+    # 3 variants x 2 floater options = 6 candidates, not the usual 10.
+    assert len(result.all_candidates["chair"]) == 6
+    assert "chair" in result.chosen_config
+
+
+def test_run_experiment_matrix_rejects_variant_subset_without_baseline(tmp_path):
+    from src.training.train_variant import ALL_TRAINING_VARIANTS
+
+    scene = _chair_scene()
+    depth_reg_only = [
+        v for v in ALL_TRAINING_VARIANTS if v.name == "depth_reg"
+    ]
+
+    with pytest.raises(ValueError, match="baseline"):
+        run_experiment_matrix_pipeline(
+            scenes=[scene],
+            screening_train_fn=lambda *a, **k: None,
+            final_train_fn=lambda *a, **k: None,
+            render_fn=lambda *a, **k: None,
+            prune_fn=lambda *a, **k: None,
+            lpips_model=_StubLpipsModel(),
+            psnr_max=30.0,
+            vram_budget_bytes=16 * 1024**3,
+            output_root=tmp_path,
+            variants=depth_reg_only,
+        )
+
+
 def test_run_experiment_matrix_fails_closed_when_a_scene_is_skipped(
     tmp_path,
 ):

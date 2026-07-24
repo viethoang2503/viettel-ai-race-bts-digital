@@ -154,11 +154,18 @@ def run_experiment_matrix_pipeline(
     extra_candidates_by_scene: dict[str, list[dict]] | None = None,
     tiebreak_threshold: float = 0.01,
     training_seed: int = 0,
+    variants: list | None = None,
 ) -> ExperimentPipelineResult:
     output_root = Path(output_root)
     result = ExperimentPipelineResult()
     scene_render_dirs = {}
     extra_candidates_by_scene = extra_candidates_by_scene or {}
+    # Screening always includes "baseline" -- it is the control every other
+    # variant is compared against; dropping it would make the comparison
+    # meaningless, not just cheaper.
+    variants = list(variants) if variants is not None else ALL_TRAINING_VARIANTS
+    if not any(variant.name == "baseline" for variant in variants):
+        raise ValueError("variants must include the 'baseline' control variant")
 
     for scene in scenes:
         report = validate_scene(scene)
@@ -216,7 +223,7 @@ def run_experiment_matrix_pipeline(
         )
 
         candidates = []
-        for variant in ALL_TRAINING_VARIANTS:
+        for variant in variants:
             train_output_dir = scene_output / f"eval_{variant.name}"
             eval_checkpoint = screening_train_fn(
                 filtered_scene,
