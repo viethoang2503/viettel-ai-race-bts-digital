@@ -14,4 +14,5 @@ def select_best_candidate(candidates: list[dict], vram_budget_bytes: int) -> dic
         return max(fitting, key=lambda candidate: candidate["score"])
 
     smallest = min(candidates, key=lambda candidate: candidate["estimated_vram_bytes"])
-    return {**smallest, "fallback_reason": "no candidate fit the VRAM budget"}
+    smallest["fallback_reason"] = "no candidate fit the VRAM budget"
+    return smallest

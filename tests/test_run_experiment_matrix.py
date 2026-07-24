@@ -58,7 +58,7 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     final_calls = []
     render_calls = []
 
-    def fake_screening_train_fn(scene_arg, variant, output_dir):
+    def fake_screening_train_fn(scene_arg, variant, output_dir, seed=0):
         screening_calls.append(variant.name)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +71,7 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
         variant,
         output_dir,
         hyperparam_overrides=None,
+        seed=0,
     ):
         final_calls.append(
             (variant.name, str(output_dir), hyperparam_overrides)
@@ -174,6 +175,12 @@ def test_run_experiment_matrix_screens_all_variants_and_uses_full_iterations_for
     )
 
     assert "chair" in result.chosen_config
+    chosen = result.chosen_config["chair"]
+    assert chosen["seed"] == 0
+    assert chosen["selection_checkpoint_path"]
+    assert chosen["final_checkpoint_path"]
+    assert chosen["final_estimated_vram_bytes"] > 0
+    assert chosen["final_render_config"]["vram_budget_bytes"] == 16 * 1024**3
     assert result.submission_zip is not None
     assert result.submission_zip.exists()
 
@@ -202,6 +209,7 @@ def test_run_experiment_matrix_fails_closed_when_a_scene_is_skipped(
         variant,
         output_dir,
         hyperparam_overrides=None,
+        seed=0,
     ):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)

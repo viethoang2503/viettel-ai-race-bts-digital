@@ -153,6 +153,7 @@ def run_experiment_matrix_pipeline(
     output_root: Path,
     extra_candidates_by_scene: dict[str, list[dict]] | None = None,
     tiebreak_threshold: float = 0.01,
+    training_seed: int = 0,
 ) -> ExperimentPipelineResult:
     output_root = Path(output_root)
     result = ExperimentPipelineResult()
@@ -221,6 +222,7 @@ def run_experiment_matrix_pipeline(
                 filtered_scene,
                 variant,
                 train_output_dir,
+                seed=training_seed,
             )
             render_config = _render_config_for(
                 variant,
@@ -252,6 +254,7 @@ def run_experiment_matrix_pipeline(
                             checkpoint
                         ),
                         "checkpoint_path": str(checkpoint),
+                        "seed": training_seed,
                     }
                 )
 
@@ -286,6 +289,7 @@ def run_experiment_matrix_pipeline(
                 filtered_scene,
                 variant,
                 tiebreak_output_dir,
+                seed=training_seed,
             )
             render_config = _render_config_for(
                 variant,
@@ -343,6 +347,7 @@ def run_experiment_matrix_pipeline(
                 variant,
                 extra_output_dir,
                 hyperparam_overrides=overrides,
+                seed=training_seed,
             )
             render_config = _render_config_for(
                 variant,
@@ -379,6 +384,7 @@ def run_experiment_matrix_pipeline(
                     ),
                     "checkpoint_path": str(checkpoint),
                     "hyperparam_overrides": overrides,
+                    "seed": training_seed,
                 }
             )
 
@@ -387,7 +393,12 @@ def run_experiment_matrix_pipeline(
             candidates,
             vram_budget_bytes,
         )
-        result.chosen_config[scene.name] = winner
+        chosen_config = {
+            **winner,
+            "selection_checkpoint_path": winner["checkpoint_path"],
+            "seed": training_seed,
+        }
+        result.chosen_config[scene.name] = chosen_config
         result.per_scene_scores[scene.name] = winner["score"]
 
         winning_variant = next(
@@ -408,6 +419,7 @@ def run_experiment_matrix_pipeline(
             hyperparam_overrides=winner.get(
                 "hyperparam_overrides"
             ),
+            seed=training_seed,
         )
         final_render_config = _render_config_for(
             winning_variant,
@@ -419,18 +431,29 @@ def run_experiment_matrix_pipeline(
                 bbox_min,
                 bbox_max,
             )
+        final_metadata = {
+            "final_checkpoint_path": str(final_checkpoint),
+        }
+        winner.update(final_metadata)
+        chosen_config.update(final_metadata)
         try:
             final_estimated_vram = _ensure_checkpoint_fits_budget(
                 final_checkpoint,
                 vram_budget_bytes,
             )
         except VramBudgetExceededError as error:
+            estimated_bytes = _candidate_vram_bytes(final_checkpoint)
+            winner["final_estimated_vram_bytes"] = estimated_bytes
+            chosen_config["final_estimated_vram_bytes"] = estimated_bytes
             result.validation_problems.append(
                 f"scene '{scene.name}': {error}"
             )
             continue
         winner["final_estimated_vram_bytes"] = final_estimated_vram
+        chosen_config["final_estimated_vram_bytes"] = final_estimated_vram
         final_render_config["vram_budget_bytes"] = vram_budget_bytes
+        winner["final_render_config"] = final_render_config
+        chosen_config["final_render_config"] = final_render_config
 
         test_render_dir = scene_output / "test_render"
         test_params_list = load_test_poses_csv(
@@ -448,6 +471,11 @@ def run_experiment_matrix_pipeline(
                 f"scene '{scene.name}': {error}"
             )
             continue
+        measured_peak = final_render_config.get(
+            "measured_peak_vram_bytes"
+        )
+        winner["final_measured_peak_vram_bytes"] = measured_peak
+        chosen_config["final_measured_peak_vram_bytes"] = measured_peak
         scene_render_dirs[
             scene.effective_submission_dir
         ] = test_render_dir

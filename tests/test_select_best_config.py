@@ -39,6 +39,9 @@ def test_falls_back_to_smallest_when_nothing_fits_budget():
     best = select_best_candidate(candidates, vram_budget_bytes=2_000)
     assert best["variant"] == "depth_reg"
     assert best["fallback_reason"] == "no candidate fit the VRAM budget"
+    assert candidates[1]["fallback_reason"] == (
+        "no candidate fit the VRAM budget"
+    )
 
 
 def test_raises_on_empty_candidate_list():
