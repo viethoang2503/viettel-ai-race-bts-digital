@@ -1,4 +1,5 @@
 import inspect
+import random
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,8 @@ from src.training.train_variant import (
     _apply_hyperparam_overrides,
     _build_dataset_args,
     _prepare_depth_regularization_inputs,
+    _seed_everything,
+    _validate_training_request,
     run_training_variant,
 )
 
@@ -51,6 +54,46 @@ def test_run_training_variant_signature_accepts_hyperparam_overrides():
     params = inspect.signature(run_training_variant).parameters
     assert "hyperparam_overrides" in params
     assert params["hyperparam_overrides"].default is None
+    assert params["seed"].default == 0
+    assert params["checkpoint_interval"].default == 5000
+
+
+def test_seed_everything_repeats_python_numpy_and_torch_streams():
+    _seed_everything(123)
+    first = (
+        random.random(),
+        np.random.random(),
+        torch.rand(3),
+    )
+
+    _seed_everything(123)
+    second = (
+        random.random(),
+        np.random.random(),
+        torch.rand(3),
+    )
+
+    assert first[0] == second[0]
+    assert first[1] == second[1]
+    torch.testing.assert_close(first[2], second[2])
+
+
+@pytest.mark.parametrize(
+    ("iterations", "seed", "checkpoint_interval", "message"),
+    [
+        (0, 0, 5000, "iterations"),
+        (10, -1, 5000, "seed"),
+        (10, 0, 0, "checkpoint_interval"),
+    ],
+)
+def test_validate_training_request_rejects_invalid_values(
+    iterations,
+    seed,
+    checkpoint_interval,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        _validate_training_request(iterations, seed, checkpoint_interval)
 
 
 def test_build_dataset_args_preserves_full_resolution_and_safe_densification(

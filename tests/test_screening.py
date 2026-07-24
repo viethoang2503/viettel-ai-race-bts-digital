@@ -1,3 +1,5 @@
+import pytest
+
 from src.evaluation.screening import (
     build_hyperparam_candidates,
     needs_tiebreak_rerun,
@@ -79,3 +81,12 @@ def test_build_hyperparam_candidates_merges_and_labels():
 
 def test_build_hyperparam_candidates_handles_empty_overrides():
     assert build_hyperparam_candidates({"variant": "baseline"}, [], "chair") == []
+
+
+def test_build_hyperparam_candidates_rejects_more_than_four_extras():
+    with pytest.raises(ValueError, match="at most 4"):
+        build_hyperparam_candidates(
+            {"variant": "baseline"},
+            [{"iterations": value} for value in range(5)],
+            "chair",
+        )

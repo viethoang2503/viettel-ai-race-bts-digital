@@ -34,6 +34,10 @@ def build_hyperparam_candidates(
     extra_overrides: list[dict[str, object]],
     label_prefix: str,
 ) -> list[dict[str, object]]:
+    if len(extra_overrides) > 4:
+        raise ValueError(
+            "bounded hyperparameter search accepts at most 4 extras per scene"
+        )
     candidates = []
     for index, override in enumerate(extra_overrides):
         merged = {**base_overrides, **override}

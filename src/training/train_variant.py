@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,29 @@ ALL_TRAINING_VARIANTS: list[TrainingVariant] = [
     TrainingVariant("appearance_embed", False, False, True),
     TrainingVariant("full_stack", True, True, True),
 ]
+
+
+def _validate_training_request(
+    iterations: int,
+    seed: int,
+    checkpoint_interval: int,
+) -> None:
+    if not isinstance(iterations, int) or iterations <= 0:
+        raise ValueError("iterations must be a positive integer")
+    if not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    if not isinstance(checkpoint_interval, int) or checkpoint_interval <= 0:
+        raise ValueError("checkpoint_interval must be a positive integer")
+
+
+def _seed_everything(seed: int) -> None:
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _build_dataset_args(
@@ -124,8 +148,11 @@ def run_training_variant(
     output_dir: Path,
     iterations: int,
     hyperparam_overrides: dict[str, object] | None = None,
+    seed: int = 0,
+    checkpoint_interval: int = 5000,
 ) -> Path:
     """Train one variant with the checked-out differentiable CUDA renderer."""
+    _validate_training_request(iterations, seed, checkpoint_interval)
     from random import randint
 
     import torch
@@ -154,6 +181,12 @@ def run_training_variant(
         iterations,
         hyperparam_overrides,
     )
+    _validate_training_request(
+        effective_iterations,
+        seed,
+        checkpoint_interval,
+    )
+    _seed_everything(seed)
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     gs_scene = Scene(dataset, gaussians)
