@@ -12,10 +12,9 @@ def write_images_binary(images: dict, path: Path) -> None:
     (str) — i.e. the same shape as entries returned by
     scene/colmap_loader.py::read_extrinsics_binary in the vendored repo.
 
-    Per-image point2D track data is not supported by this writer:
-    num_points2D is always written as 0. This is safe for this pipeline
-    because the baseline train.py never reads point2D tracks from
-    images.bin, only pose/camera_id/name.
+    Per-image point2D tracks are preserved. The variant training path uses
+    these observations for sparse-depth supervision, so dropping them while
+    building a holdout-filtered scene would silently disable depth loss.
     """
     path = Path(path)
     with open(path, "wb") as fid:
@@ -29,7 +28,21 @@ def write_images_binary(images: dict, path: Path) -> None:
                 int(img.camera_id),
             ))
             fid.write(img.name.encode("utf-8") + b"\x00")
-            fid.write(struct.pack("<Q", 0))  # num_points2D
+            xys = getattr(img, "xys", ())
+            point3d_ids = getattr(img, "point3D_ids", ())
+            if len(xys) != len(point3d_ids):
+                raise ValueError(
+                    f"{img.name}: track length mismatch: "
+                    f"{len(xys)} xys vs {len(point3d_ids)} point3D_ids"
+                )
+            fid.write(struct.pack("<Q", len(xys)))
+            for xy, point3d_id in zip(xys, point3d_ids):
+                fid.write(struct.pack(
+                    "<ddq",
+                    float(xy[0]),
+                    float(xy[1]),
+                    int(point3d_id),
+                ))
 
 
 def write_cameras_binary(cameras: dict, path: Path) -> None:

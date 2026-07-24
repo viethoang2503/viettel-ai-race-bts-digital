@@ -5,18 +5,27 @@ import cv2
 import numpy as np
 import pytest
 
-from src.common.colmap_io import read_intrinsics_binary
+from src.common.colmap_io import read_extrinsics_binary, read_intrinsics_binary
 from src.common.config import SceneConfig
 from src.training.colmap_writer import write_images_binary
-from src.training.undistort_scene import undistort_scene
+from src.training.undistort_scene import _undistort_observations, undistort_scene
 
 
 class _FakeImage:
-    def __init__(self, name, camera_id):
+    def __init__(self, name, camera_id, xys=None, point3d_ids=None):
+        self.id = 1
         self.qvec = np.array([1.0, 0.0, 0.0, 0.0])
         self.tvec = np.array([0.0, 0.0, 0.0])
         self.camera_id = camera_id
         self.name = name
+        self.xys = np.asarray(
+            xys if xys is not None else [[4.0, 4.0]],
+            dtype=np.float64,
+        )
+        self.point3D_ids = np.asarray(
+            point3d_ids if point3d_ids is not None else [17],
+            dtype=np.int64,
+        )
 
 
 def _write_camera(path, camera_id, model_id, width, height, params):
@@ -72,6 +81,46 @@ def test_undistort_scene_converts_simple_radial_to_pinhole(tmp_path):
     assert cx == pytest.approx(32.0)
     assert cy == pytest.approx(24.0)
     assert (result.train_images_dir / "0001.jpg").exists()
+
+
+def test_undistort_observations_matches_opencv_projection():
+    camera_matrix = np.array(
+        [[80.0, 0.0, 32.0], [0.0, 80.0, 24.0], [0.0, 0.0, 1.0]],
+    )
+    distortion = np.array([0.15, 0.0, 0.0, 0.0])
+    xys = np.array([[2.0, 3.0], [60.0, 42.0]])
+    expected = cv2.undistortPoints(
+        xys.reshape(-1, 1, 2),
+        camera_matrix,
+        distortion,
+        P=camera_matrix,
+    ).reshape(-1, 2)
+
+    actual = _undistort_observations(xys, camera_matrix, distortion)
+
+    np.testing.assert_allclose(actual, expected)
+    assert not np.allclose(actual, xys)
+
+
+def test_undistort_scene_rewrites_observation_coordinates(tmp_path):
+    scene = _make_scene(
+        tmp_path,
+        model_id=2,
+        params=[80.0, 32.0, 24.0, 0.15],
+    )
+    original = read_extrinsics_binary(str(scene.sparse_dir / "images.bin"))[1]
+
+    result = undistort_scene(scene, tmp_path / "undistorted")
+
+    transformed = read_extrinsics_binary(
+        str(result.sparse_dir / "images.bin"),
+    )[1]
+    assert transformed.xys.shape == original.xys.shape
+    assert not np.allclose(transformed.xys, original.xys)
+    np.testing.assert_array_equal(
+        transformed.point3D_ids,
+        original.point3D_ids,
+    )
 
 
 def test_undistort_scene_is_noop_for_already_supported_model(tmp_path):

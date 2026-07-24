@@ -9,7 +9,7 @@ import numpy as np
 
 from src.common.colmap_io import load_sparse_scene
 from src.common.config import SceneConfig
-from src.training.colmap_writer import write_cameras_binary
+from src.training.colmap_writer import write_cameras_binary, write_images_binary
 
 ALREADY_SUPPORTED_MODELS = {"PINHOLE", "SIMPLE_PINHOLE"}
 UNDISTORTABLE_MODELS = {"SIMPLE_RADIAL"}
@@ -21,6 +21,26 @@ class _PinholeCamera:
     width: int
     height: int
     params: np.ndarray
+
+
+def _undistort_observations(
+    xys: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+) -> np.ndarray:
+    """Move COLMAP observations onto the same pixel grid as cv2.undistort."""
+    xys = np.asarray(xys, dtype=np.float64).reshape(-1, 2)
+    if len(xys) == 0:
+        return xys.copy()
+    transformed = cv2.undistortPoints(
+        xys.reshape(-1, 1, 2),
+        camera_matrix,
+        dist_coeffs,
+        P=camera_matrix,
+    ).reshape(-1, 2)
+    if not np.isfinite(transformed).all():
+        raise ValueError("undistorted COLMAP observations contain non-finite values")
+    return transformed
 
 
 def undistort_scene(scene: SceneConfig, output_dir: Path) -> SceneConfig:
@@ -88,8 +108,18 @@ def undistort_scene(scene: SceneConfig, output_dir: Path) -> SceneConfig:
         undistorted = cv2.undistort(pixels, k_matrix, dist_coeffs, newCameraMatrix=k_matrix)
         cv2.imwrite(str(dst_path), undistorted)
 
+    transformed_images = {}
+    for image_id, image in sparse.images.items():
+        mapping = undistort_maps[image.camera_id]
+        transformed_xys = (
+            np.asarray(image.xys, dtype=np.float64).reshape(-1, 2)
+            if mapping is None
+            else _undistort_observations(image.xys, *mapping)
+        )
+        transformed_images[image_id] = image._replace(xys=transformed_xys)
+
     write_cameras_binary(new_cameras, sparse_out / "cameras.bin")
-    shutil.copy(scene.sparse_dir / "images.bin", sparse_out / "images.bin")
+    write_images_binary(transformed_images, sparse_out / "images.bin")
     shutil.copy(scene.sparse_dir / "points3D.bin", sparse_out / "points3D.bin")
 
     return replace(scene, root=output_dir, train_images_dir=images_out, sparse_dir=sparse_out)
